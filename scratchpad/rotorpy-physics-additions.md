@@ -1,0 +1,408 @@
+# RotorPy Physics — Complete Model Inventory & Additions Plan
+
+**Purpose.** RotorPy is our single source of truth for validated multirotor physics. Part I lays
+out every physics model RotorPy currently implements, with the exact math as coded and a
+verification mark. Part II lists the additions collected from external sources, same format.
+Part III records verification findings and the test protocol. Everything is framework-free math,
+ready to port to the compiled custom-firmware repo; candidate items also go upstream to RotorPy
+as PRs for author review.
+
+**Verification legend:**
+- ✅ math checked against the implementation *and* a published source / independent derivation
+- ⚠️ issue found — see Part III findings
+- 🔶 checked against source code only (no independent published reference located)
+
+**Sources:**
+- RotorPy paper: Folk, Paulos, Kumar, *RotorPy: A Python-based Multirotor Simulator with
+  Aerodynamics for Education and Research*, [arXiv:2306.04485](https://arxiv.org/abs/2306.04485)
+- SkyDreamer: [arXiv:2510.14783](https://arxiv.org/abs/2510.14783) + reference implementation
+  [The-Real-Thisas/dreamerv3](https://github.com/The-Real-Thisas/dreamerv3) `embodied/envs/skydreamer.py`
+- Crazyflow: [learnsyslab/crazyflow](https://github.com/learnsyslab/crazyflow)
+  (`crazyflow/dynamics/first_principles/dynamics.py`, `crazyflow/drones/params.toml`)
+- Mahony, Kumar, Corke, *Multirotor Aerial Vehicles: Modeling, Estimation, and Control of
+  Quadrotor*, IEEE RAM 2012 (rotor drag / flapping background)
+- Graf, *Quaternions and Dynamics* (quaternion kinematics, cited in RotorPy code)
+- Genesis ([Genesis-Embodied-AI/Genesis](https://github.com/Genesis-Embodied-AI/Genesis)):
+  reviewed, **nothing to port** — prop joints fixed, RPM → `KF·rpm²` force + `KM·rpm²` yaw torque
+  only, prop spin visual-only, no gyroscopic effects.
+
+**Notation.** World frame ENU, gravity `g = 9.81`. Body frame x-forward, z-up through rotors.
+`x, v` world position/velocity; `q = [q_x,q_y,q_z,q_w]` body→world quaternion; `R = R(q)`;
+`ω = (p,q,r)` body rates (body frame); `Ω_i ≥ 0` rotor speed (rad/s); `m` mass; `I` inertia
+matrix; `r_i` rotor position in body frame; `v_a = Rᵀ(v − v_wind)` body-frame airspeed.
+
+---
+
+# Part I — RotorPy current physics (as implemented, canonical)
+
+All references `rotorpy/vehicles/multirotor.py` unless noted. The batched PyTorch twin
+(`BatchedMultirotor`, same file) implements identical math; NumPy is canonical (see P1.8).
+
+## 1.1 State and rigid-body equations of motion ✅
+
+State: `{x(3), v(3), q(4), ω(3), v_wind(3), Ω(num_rotors)}` (lines 540–575).
+
+```
+ẋ = v                                                       (:284)
+v̇ = ( [0,0,−mg] + R·F_B ) / m                               (:296,306)
+q̇ = ½ Gᵀ(q) ω          (quaternion kinematics)              (:24–41,287)
+ω̇ = I⁻¹ ( M_B − ω × (I ω) )      (Euler's equation)         (:308–311)
+v̇_wind = 0   (wind overwritten externally each step by wind profile)   (:313–315)
+```
+
+with, for `q = [q_x,q_y,q_z,q_w] = [q0,q1,q2,q3]`:
+
+```
+        ⎡  q3   q2  −q1  −q0 ⎤
+G(q) =  ⎢ −q2   q3   q0  −q1 ⎥        q̇ = ½ Gᵀ ω
+        ⎣  q1  −q0   q3  −q2 ⎦
+```
+
+**Verified:** expanding row 1 gives `q̇_x = ½(q_w·p − q_z·q + q_y·r)`, matching the standard
+xyzw quaternion derivative (Graf). Renormalization after each integration step (:254).
+Euler equation sign/order verified. Full inertia matrix incl. products of inertia supported
+(:148–150).
+
+Note (batched): `quat_dot_torch` (:44–66) adds a unit-norm penalty `−(‖q‖²−1)·2q` to `q̇` —
+a Baumgarte-style constraint stabilization absent from the NumPy path. Intentional divergence;
+harmless, but cross-sim tests must compare post-normalization states.
+
+## 1.2 Motor model ✅
+
+```
+Ω̇_i = (Ω_c,i − Ω_i) / τ_m                                   (:281)
+Ω_c,i clipped to [Ω_min, Ω_max] before integration          (:211,234)
+Ω_i  clipped to [Ω_min, Ω_max] after each step              (:262)
+measured Ω_i = Ω_i + N(0, σ_motor²)   (σ_motor default 0)   (:260–262)
+```
+
+First-order lag; rotor speeds are integrated state. `τ_m`: crazyflie 0.072 s, brushless 0.050 s,
+hummingbird 0.005 s. Standard identified motor model.
+
+## 1.3 Rotor thrust, yaw torque, control allocation ✅
+
+```
+T_i   = k_η · Ω_i² · ẑ                    (thrust, body z)   (:341)
+M_yaw = Σ_i σ_i · k_m · Ω_i² · ẑ          (yaw)              (:362)
+M_force = Σ_i r_i × (T_i + H_i)           (thrust/drag moments)  (:361)
+```
+
+**⚠ Convention (critical for ports):** `rotor_directions` (σ_i) is defined as **the sign of the
+yaw torque the rotor produces** (crazyflie_params.py:37 "direction of the torque"), i.e. the
+*negative* of the physical spin direction: `spin_i = −σ_i`. Any added spin-dependent physics
+(gyroscopic terms, A5) must use `spin_i = −σ_i`, not σ_i.
+
+**Verified:** `M_force = −einsum('ijk,ik->j', hat(r), T+H)` (:361) looks sign-flipped but is
+correct — `hat_map` on an (n,3) array returns shape (3,3,n) (:531–534), so the einsum contracts
+`Σ_i hat(r_k)[i,j]·F_k[i] = (hat(r_k)ᵀF_k)[j] = −(r_k×F_k)[j]`; the leading minus restores
+`+Σ r_k × F_k = Σ r × F`. ✓
+
+Allocation (control side): `f_to_TM = [1ᵀ; (r_i×ẑ)_{x,y}; (k_m/k_η)·σᵀ]`, `TM_to_f` its inverse
+(:167–173); speeds from forces via `sign(f)·√|f/k_η|` (:479–480).
+
+## 1.4 Aerodynamics ✅ (source: RotorPy paper §III; Mahony et al. 2012)
+
+Enabled by `aero=True`. Per-rotor local airspeed includes rotation lever arm:
+
+```
+v_i = v_a + ω × r_i                                          (:338)
+```
+
+| Effect | Equation | Acts at | Line |
+|---|---|---|---|
+| Parasitic drag | `D = −‖v_a‖ · diag(c_Dx,c_Dy,c_Dz) · v_a` | CoM | :346 |
+| Rotor drag (H-force) | `H_i = −Ω_i · diag(k_d, k_d, k_z) · v_i` | hub i | :348 |
+| Blade-flapping moment | `M_flap,i = −k_flap · Ω_i · (v_i × ẑ)` | hub i | :351 |
+| Translational lift | `T_i += k_h · (v_i,x² + v_i,y²) · ẑ` | hub i | :352–353 |
+
+Totals: `F_B = Σ(T_i + H_i) + D`;  `M_B = Σ r_i×(T_i+H_i) + M_yaw + Σ M_flap,i` (:365–366).
+
+**Verified:** `hat(v)·ẑ = v×ẑ = (v_y, −v_x, 0)`, so forward flight (`v_x>0`) gives
+`M_flap,y = +k_flap·Ω·v_x` → pitch-up, the correct rotor-flapping response (Mahony et al. §III).
+H-force linear in `Ω·v` matches the induced-drag model (k_z = induced inflow on the rotor axis).
+Note SkyDreamer's drag `−k_x·v_x·ΣΩ − k_x2·v_x|v_x|` is the same physics as {k_d summed over
+rotors} + {c_Dx}; do not double-count when porting parameter values.
+
+**Explicitly not modeled** (README + code): ground effect, downwash/rotor-rotor interaction,
+frame lift, rotor inertia (→ A5), thrust variation with airspeed beyond k_h/k_z (→ B1).
+
+## 1.5 Ground contact (heuristic, not physics-grade) 🔶
+
+Optional (`enable_ground`). Normal force cancels net downward force at z≤0 (:299–303); post-step:
+clamp z=0, v_z≥0, horizontal velocity damping `v_xy ← (1−β)·v_xy` (β∈[0.1,0.5]), zero body rates,
+flatten roll/pitch (:484–513). Adequate for takeoff/landing bookkeeping; do **not** port as
+contact physics.
+
+## 1.6 Sensor models
+
+**IMU** (`rotorpy/sensors/imu.py`) — intended measurement model, for a sensor at body offset
+`p_BS`, mounting rotation `R_BS`, world gravity `g_W = [0,0,−g]`:
+
+```
+a_S,W  = a_B,W + R_WB·( ω̇_B × p_BS + ω_B × (ω_B × p_BS) )        (rigid-body point acceleration)
+accel  = R_BSᵀ · R_WBᵀ · (a_S,W − g_W)  + b_a + η_a               (specific force)
+gyro   = R_BSᵀ · ω_B                    + b_g + η_g
+η ~ N(0, (noise_density)²·f_s/2),   ḃ ~ random walk (bias_step)
+```
+
+⚠️ **Two frame-handling defects found in the implementation** (imu.py:100–128) — see Part III
+findings F-1, F-2. The equations above are the correct target; the defects are invisible in the
+default config (`p_BS = 0`, `R_BS = I`).
+
+**Motion capture** (`sensors/external_mocap.py`) ✅: pose+twist with per-channel Gaussian noise;
+attitude noise applied as SO(3) perturbation quaternion; optional artifact spikes on v/ω.
+
+**Motor speed measurement**: Gaussian noise on Ω (P1.2).
+
+## 1.7 Wind models (`rotorpy/wind/`) ✅
+
+Interface: `v_wind = f(t, x)` world frame, injected into the state each step. `NoWind`,
+`ConstantWind`, `SinusoidWind` (per-axis `A·sin(2πft + φ)`), `LadderWind` (steps), `WindTunnel`
+(spatial cylinder), `DrydenGust` — MIL-HDBK-1797 Dryden turbulence spectra via the
+`wind-dynamics` package (published standard model).
+
+## 1.8 Integration ✅
+
+NumPy: `scipy.solve_ivp`, default adaptive RK45, configurable (:183–186,242–247). Batched:
+`torchdiffeq.odeint`, dopri5 or fixed-step rk4. Sim rate default 100 Hz. Post-step quaternion
+renormalization both paths. (For firmware port: fixed-step RK4 is the reference-matching choice;
+SkyDreamer used RK4 @ 2.2 ms.)
+
+## 1.9 Existing domain-randomization machinery (data plumbing, not physics)
+
+`learning_utils.py`: samples/applies mass, k_η, k_m, inertia, τ_m, motor noise;
+`BatchedMultirotorParams.update_*` also covers drag coefficients. Default ranges only cover
+mass + k_η → extended by Part II-D.
+
+---
+
+# Part II — Additions (external sources, math verified)
+
+## A. Actuator / motor models
+
+### A1. Per-rotor coefficient asymmetry ✅(source-verified)
+**Source:** SkyDreamer Table II — individual `k_p1..4`, `k_q1..4`, `k_r1..8` per motor (values
+differ motor-to-motor ~25%); implementation lines 282–285 confirm per-rotor use.
+**Math:** promote `k_η`, `k_m` (optionally `k_d`, `k_z`) to per-rotor values:
+```
+T_i = k_η,i · Ω_i² · ẑ        M_yaw = Σ σ_i · k_m,i · Ω_i² · ẑ
+```
+**⚠ Porting note (verified against their code):** SkyDreamer's dynamics outputs *accelerations
+directly* — `v̇ = R·(D_x,D_y,T) − g·ẑ` with **no mass division** (their lines 291–293) and
+`ω̇ = (M_x,M_y,M_z)` with **no inertia inverse** (lines 302–304). Their coefficients are therefore
+mass-normalized (k_w: m/s² per (rad/s)²) and inertia-normalized (k_p: rad/s² per (rad/s)²).
+Porting into RotorPy's force/torque form requires `k_η = m·k_w`, `k_p^RotorPy = I_xx·k_p^SkyD`,
+etc. Their lumped `J_x·q·r` terms are RotorPy's `−ω×Iω` (already present — sign structure
+verified: `J_x=(I_yy−I_zz)/I_xx<0`, `J_y=(I_zz−I_xx)/I_yy>0` ✓); do not add twice.
+**RotorPy site:** wrench (:341,362) + allocation `TM_to_f`; defaults identical per rotor.
+
+### A2. Polynomial thrust/torque curves ✅(source-verified)
+**Source:** Crazyflow `first_principles/dynamics.py:121,129`; identified in `params.toml`.
+```
+T_i = c₀ + c₁·Ω_i + c₂·Ω_i²          τ_yaw,i = d₀ + d₁·Ω_i + d₂·Ω_i²
+Ω_i(T) = ( −c₁ + √(c₁² − 4c₂(c₀ − T_i)) ) / (2c₂)      (allocation inverse, transform.py)
+```
+Identified (Crazyflie, **RPM units** — convert: `c₁^rad/s = c₁·60/2π`, `c₂^rad/s = c₂·(60/2π)²`):
+cf2x_L250 thrust `[0, −5.382e-7, 2.458e-10]`, torque `[0, 1.410e-9, 1.459e-12]`; 3 more variants
+in params.toml. Quadratic-formula inversion verified (positive root ✓).
+**RotorPy site:** params `k_eta → [c₀,c₁,c₂]` default `[0,0,k_η]`; wrench + inversions :384/:480.
+
+### A3. Nonlinear command→steady-state speed curve ✅(source-verified)
+**Source:** SkyDreamer paper Eq. (motor model) + impl lines 253–256.
+```
+Ω_c = (Ω_max − Ω_min) · √( k·u² + (1−k)·u ) + Ω_min ,    u ∈ [0,1],  k ∈ [0,1]
+```
+Verified: u=0 → Ω_min, u=1 → Ω_max, monotone on [0,1] for k∈[0,1] ✓. Identified: k = 0.50,
+Ω_min = 341.75, Ω_max = 3100 rad/s (5" racer). Note their sim integrates a *normalized* rotor
+state over a fixed [0, 3000] rad/s range (lines 243–246, 306–309) — an implementation detail,
+not physics; port the physical form above.
+**RotorPy site:** new control abstraction in `get_cmd_motor_speeds`.
+
+### A4. Asymmetric rotor spin-up/spin-down dynamics ✅(source-verified)
+**Source:** Crazyflow `first_principles/dynamics.py:115–119` + params.toml.
+```
+Ω̇ = k_a1·(Ω_c − Ω) + k_a2·(Ω_c² − Ω²)     if Ω_c > Ω    (spin-up)
+Ω̇ = k_d1·(Ω_c − Ω) + k_d2·(Ω_c² − Ω²)     otherwise     (spin-down)
+```
+Reduces to P1.2 with `k_a1 = k_d1 = 1/τ_m`, `k_2 = 0`. Consistency check (cf2x_L250, RPM units,
+coefs `[7.356, 0, 0, 2.444e-4]`): near hover (~10 kRPM) the quadratic term contributes
+`k₂·(Ω_c+Ω) ≈ 4.9 s⁻¹`, total effective rate ≈ 12 s⁻¹ → τ ≈ 0.08 s, agreeing with RotorPy's
+identified crazyflie `τ_m = 0.072 s` ✓. cf21B_500 spin-up ≈ 2.4× faster than spin-down.
+**RotorPy site:** :281 (+batched :902); 4 optional coefficients, `τ_m` fallback.
+
+### A5. Rotor inertia: reaction torque + gyroscopic precession ✅(derivation) / ⚠(Crazyflow sign)
+**Sources:** Crazyflow `first_principles/dynamics.py:142–149` (identified `prop_inertia`);
+SkyDreamer `k_r5..8·Ω̇` yaw terms (reaction part, identified); independent derivation below.
+Genesis implements **neither** (verified).
+**Math.** Let `s_i = spin direction = −σ_i` under RotorPy's torque-sign convention (P1.3!).
+Rotor angular momentum `h = I_r · (Σ_i s_i Ω_i) · ẑ`:
+```
+τ_reaction = −I_r · Σ_i s_i·Ω̇_i · ẑ  =  +I_r · Σ_i σ_i·Ω̇_i · ẑ          (yaw)
+τ_gyro     = −ω × h  =  I_r·(Σ_i s_i Ω_i) · ( −q, +p, 0 )ᵀ               (roll/pitch)
+```
+Derivation of τ_gyro: `ω×h = (p,q,r)×(0,0,h_z) = (q·h_z, −p·h_z, 0)`; torque on body `= −ω×h
+= (−q·h_z, +p·h_z, 0)`. **The x and y components must have opposite signs.**
+**⚠ Crazyflow discrepancy (report upstream to them):** their implementation uses the same sign
+on both components — `I_p·(−q·S, −p·S, ·)` with `S = Σ mix_z,i·Ω_i` (accessor `torque_inertia`).
+Whichever spin convention their `mixing_matrix` z-row encodes, exactly one of the two components
+is flipped. Their z (reaction) term is consistent with their yaw-drag convention ✓.
+**Identified `I_r`:** 34.52e-9 (cf2x_L250), 26.97e-9 (P250), 38.93e-9 (T350/B500) kg·m²;
+5" racer ≈ 5–8e-6 kg·m² (estimate from prop mass/geometry). Magnitude: vanishes for balanced
+counter-rotating pairs; ≈5–10% of available roll/pitch moment during hard yaw + high body rate.
+**RotorPy site:** new `I_rotor` param; two terms in `compute_body_wrench` (`Ω̇` available from the
+motor model).
+
+### A6. Motor command latency ✅(paper)
+**Source:** SkyDreamer paper (11 ms action delay in training; not in their repo).
+```
+u_applied(t) = u_cmd(t − t_d)        (ring buffer of round(t_d/dt) steps, default t_d = 0)
+```
+**RotorPy site:** `step()` before the motor model, both paths.
+
+### A7. PWM quantization + supply-voltage layer ✅(source-verified)
+**Source:** Crazyflow params.toml (`pwm_min=7000, pwm_max=65535`, `vmotor2*` polynomials),
+`control/transform.py`.
+```
+u_q = round(u·(pwm_max−pwm_min)) / (pwm_max−pwm_min)             (quantization, optional)
+T(V) = a₀ + a₁V + a₂V² + a₃V³        (voltage→thrust, per motor)
+Ω(V) = b₀ + b₁V                      (voltage→RPM)
+V(t) = V₀ − R_int·i(t) − k_sag·∫i dt   (sag; minimal variant: Ω_max(t) = Ω_max,0·(1−c·t))
+```
+Identified: cf2x_L250 `vmotor2thrust = [−0.01483, 0.04724, −0.01847, 0.005961]`,
+`vmotor2rpm = [2968.18, 6647.95]`; all four variants in params.toml. Supporting field data:
+SkyDreamer measured Ω_max 3200→2200 rad/s (−30%) over one battery.
+**RotorPy site:** optional battery state modulating Ω_max / thrust curve; quantization in the
+command path.
+
+## B. Aerodynamics
+
+### B1. Thrust vs. rotor angle-of-attack and advance ratio ✅(source-verified)
+**Source:** SkyDreamer paper + impl lines 274–280; identified to ~racing speeds.
+```
+ω̄ = mean(Ω_i)
+α  = atan2( v_a,z ,  r_prop·ω̄ )                    (rotor angle of attack)
+μ  = atan2( ‖v_a,xy‖ ,  r_prop·ω̄ )                 (advance ratio angle)
+T_total = k_w · (1 + k_angle·α + k_hor·μ) · Σ Ω_i²  −  k_v2 · v_a,z·|v_a,z|
+```
+Identified (**mass-normalized** — multiply by m when porting, see A1 note): `k_w = 1.55e-6`,
+`k_angle = 3.145`, `k_hor = 7.245`, `k_v2 = 0`, `r_prop = 0.0635 m`.
+Relation to P1.4: `k_z`/`k_h` are the small-airspeed linearizations of this multiplicative
+correction; a vehicle should use either {k_angle,k_hor} or {k_h}, not both, to avoid
+double-counting the in-plane effect. Gate behind `k_angle = k_hor = 0` defaults.
+**RotorPy site:** `compute_body_wrench`; needs `r_prop` param.
+
+## C. Stochastic disturbance models
+
+### C1. Two-band wrench disturbances + command noise ✅(paper values; Crazyflow pattern)
+**Source:** SkyDreamer paper Table III (not in their repo); integration pattern = Crazyflow's
+first-class `dist_f`/`dist_t` inputs (`first_principles/dynamics.py:154–162`).
+```
+v̇ += ε_a(t)            (specific force, m/s² — for force-form multiply by m; fix & document frame)
+ω̇ += ε_M(t)            (Table III specifies angular acceleration, rad/s² — torque-form: I·ε_M)
+u_i ← clip(u_i + ε_u,i(t), 0, 1)
+```
+Piecewise-constant, resampled per channel:
+
+| Channel | Rate | Training | Eval |
+|---|---|---|---|
+| ε_a | 1 Hz | ±3 m/s² | ±2 m/s² |
+| ε_M | 1 Hz | ±3 rad/s² | ±2 rad/s² |
+| ε_M | 90 Hz | ±125 rad/s² | ±100 rad/s² |
+| ε_u | 90 Hz | ±0.2 | — |
+
+**RotorPy site:** a `wrench_profile` channel parallel to `wind_profile` (keeps `Multirotor`
+deterministic). Default off.
+
+### C2. Slow parameter drift (battery sag)
+Covered by A7; minimal variant `Ω_max(t) = Ω_max,0·(1 − c·t)`, c ≈ 30% per battery duration
+(SkyDreamer field data).
+
+## D. Domain-randomization ranges (data, not a feature)
+
+Extend `learning_utils.py` defaults to all physical parameters, per-episode:
+
+| Parameter group | Range (SkyDreamer Table III, training) |
+|---|---|
+| Ω_min, Ω_max | ±20% |
+| mass, inertia, thrust/torque/drag coefficients, τ_m (or A4 coefs), curve shape k, r_prop, I_rotor, per-rotor k_η,i/k_m,i | ±30% |
+| Eval (if distinguished) | ±20% |
+
+Keep the existing hover-feasibility bound on k_η (learning_utils.py:40–53).
+
+## E. Out of scope for RotorPy (tracked so nothing is lost)
+
+Camera models (extrinsics DR, rolling shutter, mask erosion, StochGAN); learning plumbing
+(image delay, rewards, privileged info); firmware controller emulation (Crazyflow Mellinger
+port) and sim/control rate decoupling → firmware repo; MJX contact/ray rendering; CasADi twins.
+
+---
+
+# Part III — Verification findings & test protocol
+
+## Findings from this review (2026-07-07)
+
+**F-1 ⚠ RotorPy IMU lever-arm frame mixing** (`sensors/imu.py:110–111`): the point-acceleration
+term computes `ω̇×p_BS,W` and `ω×(ω×p_BS,W)` using **body-frame** `ω`, `ω̇` (as produced by
+`statedot` — the Euler equation output is body-frame) crossed with the **world-frame** lever arm
+`p_BS,W = R·p_BS`. Cross products must be evaluated in one frame:
+`a_S,W = a_B,W + R·(ω̇_B×p_BS + ω_B×(ω_B×p_BS))`. No effect when `p_BS = 0` (default).
+
+**F-2 ⚠ RotorPy IMU gyro ignores mounting rotation** (`sensors/imu.py:117`): accelerometer
+applies `R_BSᵀ` but the gyroscope returns body-frame `ω` directly; should be `R_BSᵀ·ω_B`.
+No effect when `R_BS = I` (default).
+
+**F-3 ⚠ Crazyflow gyroscopic precession sign** (their `abd/accessor.py` torque_inertia /
+`first_principles/dynamics.py:142–149`): x,y components implemented with the same sign
+`(−q, −p)`; correct is opposite signs `(−q, +p)·h_z` from `τ = −ω×h`. Exactly one axis flipped
+under any spin convention. Flag in our upstream PR and report to Crazyflow.
+
+**F-4 ⚠ SkyDreamer coefficients are mass-/inertia-normalized**: their dynamics emits
+accelerations with no `1/m` or `I⁻¹` (impl lines 291–304). All Table II force coefficients are
+per-unit-mass, all moment coefficients per-unit-inertia. Scale when porting (A1/B1 notes).
+
+**F-5 ✅ RotorPy core dynamics verified correct**, including the two subtle spots: the
+`M_force` einsum minus sign (compensates the `hat_map` (3,3,n) layout — net `+Σ r×F`, P1.3) and
+the quaternion `G` matrix (matches Graf xyzw convention, P1.1). Flapping-moment sign gives
+pitch-up in forward flight ✓. `−ω×Iω` ✓.
+
+**F-6 ⚠ Convention trap:** RotorPy `rotor_directions` = yaw-**torque** sign = −(spin sign).
+Every added spin-dependent term (A5) must use `spin = −rotor_dir`.
+
+**F-7** Genesis reviewed and excluded: no rotor physics beyond `KF·rpm²`/`KM·rpm²` on fixed
+joints; the "gyroscopic effects" attribution is unfounded.
+
+## Test protocol (run everything in RotorPy before any port)
+
+1. **Regression-zero**: every addition defaults off/neutral; with defaults, trajectories match
+   current RotorPy bit-for-bit (fixed-seed golden trajectories, both NumPy and batched).
+2. **NumPy ↔ batched equivalence**: same inputs → same derivatives to float64 tolerance
+   (compare post-quaternion-normalization; see P1.1 batched note).
+3. **Cross-simulator, SkyDreamer**: configure RotorPy with Table II parameters (applying F-4
+   scaling and the P1.4 drag-convention mapping); match their Numba sim's *state derivatives*
+   at sampled states to tolerance, then closed-loop trajectories under identical Euler @ 100 Hz.
+4. **Cross-simulator, Crazyflow**: params.toml values (RPM→rad/s conversions per A2); match
+   `first_principles` derivatives at sampled states — expect disagreement only in the A5
+   precession component per F-3 (document the delta; our sign wins per derivation).
+5. **Limit checks**: A5 terms vanish for balanced counter-rotating speeds; A3 endpoints
+   Ω_min/Ω_max; A4 reduces to first-order when k₂=0; B1 reduces to k_w·ΣΩ² at zero airspeed;
+   C1 off → deterministic.
+6. **Energy sanity**: drag/H-force/flapping terms strictly dissipative for v_wind = 0
+   (power `F_aero·v_a + M_aero·ω ≤ 0` sampled over random states).
+7. **Fix F-1/F-2** (small, isolated) and add offset/rotated-IMU unit tests against the
+   closed-form point-acceleration formula.
+8. **Upstream PRs** split: (i) IMU fixes F-1/F-2, (ii) actuator models A1–A7, (iii) aero B1,
+   (iv) disturbances C1, (v) DR ranges D — each with the derivation notes above.
+
+## Implementation order
+
+**F-1/F-2 fixes → C1 → A1 → A5 → A3 → A6 → A2 → A4 → B1 → A7/C2 → D** (payoff ÷ effort,
+fixes first because they're bugs).
+
+## Parameter appendix
+
+- SkyDreamer Table II: `SKYDREAMER_PARAMS`, their `skydreamer.py:37–58` (apply F-4 scaling).
+- Crazyflow identified sets: `crazyflow/drones/params.toml` (cf2x_L250/P250/T350, cf21B_500) —
+  mass, J, thrust/torque polys, rotor_dyn_coef, drag matrices, prop_inertia, PWM/voltage maps
+  (RPM units).
+- RotorPy vehicles: `rotorpy/vehicles/*_params.py` (crazyflie, crazyflie-brushless, hummingbird,
+  px4) — rad/s units, torque-sign rotor_directions convention (F-6).
