@@ -30,9 +30,11 @@ class Environment():
                        sim_rate     = 100,      # The update frequency of the simulator in Hz
                        safety_margin = 0.25,    # The radius of the safety region around the robot.
                        disturbance_profile = None,  # external-wrench disturbance profile; if none, no disturbance.
+                       control_rate = None,     # controller update rate in Hz (<= sim_rate); if none, updates every physics step.
                        ):
 
         self.sim_rate = sim_rate
+        self.control_rate = control_rate
         self.vehicle = vehicle
         self.controller = controller
         self.trajectory = trajectory
@@ -135,6 +137,7 @@ class Environment():
                                                                                                                     self.use_mocap,
                                                                                                                     terminate=self.terminate,
                                                                                                                     disturbance_profile=self.disturbance_profile,
+                                                                                                                    control_rate=self.control_rate,
                                                                                                                     )
         if verbose:
             # Print relevant statistics or simulator status indicators here

@@ -162,6 +162,18 @@ class Multirotor(object):
         self.k_v2            = quad_params.get('k_v2', 0.0)      # collective vertical drag-like coeff, N/(m/s)^2
         self.r_prop          = quad_params.get('r_prop', quad_params.get('rotor_radius', 0.0))  # propeller radius, m
 
+        # Translational lift (k_h) and the advance-ratio thrust correction (k_hor) both model the
+        # increase in thrust with in-plane airspeed; the angle-of-attack term (k_angle) is the
+        # vertical companion of that same SkyDreamer thrust-correction model. Enabling k_h together
+        # with either k_angle or k_hor double-counts the airspeed effect, so reject that config.
+        if self.k_h != 0.0 and (self.k_angle != 0.0 or self.k_hor != 0.0):
+            raise ValueError(
+                "Conflicting aerodynamic thrust models: k_h (translational lift) cannot be combined "
+                "with k_angle/k_hor (angle-of-attack / advance-ratio thrust correction) because they "
+                "model the same airspeed-dependent thrust and would double-count. Set k_h=0 or "
+                "k_angle=k_hor=0."
+            )
+
         # Motor parameters
         self.tau_m           = quad_params['tau_m']     # motor reponse time, seconds
         self.motor_noise     = quad_params.get('motor_noise_std', 0) # noise added to the actual motor speed, rad/s / sqrt(Hz)
@@ -815,6 +827,45 @@ class BatchedMultirotorParams:
         self.tau_m           = torch.tensor([multirotor_params['tau_m'] for multirotor_params in multirotor_params_list], device=device).unsqueeze(-1)
         self.motor_noise     = torch.tensor([multirotor_params['motor_noise_std'] for multirotor_params in multirotor_params_list], device=device).unsqueeze(-1) # noise added to the actual motor speed, rad/s / sqrt(Hz)
 
+        # ---- Optional physics additions (all default-inert, mirroring the single-drone Multirotor) ----
+        # NOTE: build tensors with dtype=double directly. torch.tensor(pylist).double() first rounds
+        # the python floats to float32 (torch's default) and only then upcasts, silently losing
+        # precision (e.g. 1/0.072 -> 13.88888931), which shows up as ~1e-4 rotor-accel errors.
+        def _col(key, default):
+            return torch.tensor([qp.get(key, default) for qp in multirotor_params_list], device=device, dtype=torch.double).unsqueeze(-1)
+        # A2 polynomial thrust/torque curve linear+constant terms (k_eta/k_m are the quadratic terms).
+        self.thrust_c0 = _col('thrust_c0', 0.0)
+        self.thrust_c1 = _col('thrust_c1', 0.0)
+        self.torque_c0 = _col('torque_c0', 0.0)
+        self.torque_c1 = _col('torque_c1', 0.0)
+        self.thrust_poly_active = any(qp.get('thrust_c0', 0.0) != 0.0 or qp.get('thrust_c1', 0.0) != 0.0 for qp in multirotor_params_list)
+        # A5 rotor inertia (gyroscopic + reaction), 0 -> off.
+        self.rotor_inertia = _col('rotor_inertia', 0.0)
+        # A4 asymmetric spin-up/spin-down coefficients [ka1,ka2,kd1,kd2]; default [1/tau,0,1/tau,0] == first-order.
+        _rdc = []
+        for qp in multirotor_params_list:
+            if 'rotor_dyn_coef' in qp:
+                _rdc.append(list(qp['rotor_dyn_coef']))
+            else:
+                inv_tau = 1.0 / qp['tau_m']
+                _rdc.append([inv_tau, 0.0, inv_tau, 0.0])
+        self.rotor_dyn_coef = torch.tensor(_rdc, device=device, dtype=torch.double)  # (num_drones, 4)
+        # B1 angle-of-attack / advance-ratio thrust correction, default inert.
+        self.k_angle = _col('k_angle', 0.0)
+        self.k_hor = _col('k_hor', 0.0)
+        self.k_v2 = _col('k_v2', 0.0)
+        self.r_prop = torch.tensor([qp.get('r_prop', qp.get('rotor_radius', 0.0)) for qp in multirotor_params_list], device=device, dtype=torch.double).unsqueeze(-1)
+        self.aoa_active = any(qp.get('k_angle', 0.0) != 0.0 or qp.get('k_hor', 0.0) != 0.0 or qp.get('k_v2', 0.0) != 0.0 for qp in multirotor_params_list)
+        # A3 motor throttle curve shape + PWM quantization for cmd_motor_throttle.
+        self.motor_curve_k = _col('motor_curve_k', 1.0)
+        self.pwm_min = _col('pwm_min', 0.0)
+        self.pwm_max = _col('pwm_max', 0.0)
+        # Guard: k_h (translational lift) cannot combine with k_angle/k_hor (double-counts in-plane airspeed).
+        for qp in multirotor_params_list:
+            if qp.get('k_h', 0.0) != 0.0 and (qp.get('k_angle', 0.0) != 0.0 or qp.get('k_hor', 0.0) != 0.0):
+                raise ValueError("Conflicting aerodynamic thrust models: k_h cannot be combined with "
+                                 "k_angle/k_hor (they double-count airspeed-dependent thrust). Set one to zero.")
+
         # Additional constants.
         self.inertia = torch.from_numpy(np.array([[[qp["Ixx"], qp["Ixy"], qp["Ixz"]],
                                                    [qp["Ixy"], qp["Iyy"], qp["Iyz"]],
@@ -1086,8 +1137,13 @@ class BatchedMultirotor(object):
         # R = Rotation.from_quat(state['q']).as_matrix()
         R = roma.unitquat_to_rotmat(state['q'][idxs]).double()
 
-        # Rotor speed derivative
-        rotor_accel = (1 / self.params.tau_m[idxs]) * (cmd_rotor_speeds - rotor_speeds)
+        # Rotor speed derivative: asymmetric spin-up/spin-down (reduces to first-order 1/tau_m by
+        # default, since rotor_dyn_coef defaults to [1/tau,0,1/tau,0]).
+        rdc = self.params.rotor_dyn_coef[idxs]
+        ka1, ka2, kd1, kd2 = rdc[:, 0:1], rdc[:, 1:2], rdc[:, 2:3], rdc[:, 3:4]
+        _d = cmd_rotor_speeds - rotor_speeds
+        _dsq = cmd_rotor_speeds ** 2 - rotor_speeds ** 2
+        rotor_accel = torch.where(cmd_rotor_speeds > rotor_speeds, ka1 * _d + ka2 * _dsq, kd1 * _d + kd2 * _dsq)
 
         # Position derivative.
         x_dot = state['v'][idxs]
@@ -1101,6 +1157,9 @@ class BatchedMultirotor(object):
 
         # Compute total wrench in the body frame based on the current rotor speeds and their location w.r.t. CoM
         (FtotB, MtotB) = self.compute_body_wrench(state['w'][idxs], rotor_speeds, body_airspeed_vector, idxs)
+
+        # Add gyroscopic + reaction moments from the spinning rotors (zero if rotor_inertia == 0).
+        MtotB = MtotB + self._rotor_inertia_moment(state['w'][idxs], rotor_speeds, rotor_accel, idxs)
 
         # Rotate the force from the body frame to the inertial frame, then add the external
         # disturbance force (world frame, zero by default).
@@ -1120,8 +1179,10 @@ class BatchedMultirotor(object):
         # The line below doesn't do anything, as the wind state is assigned elsewhere.
         wind_dot = torch.zeros((len(idxs), 3), device=self.device)
 
-        # Pack into vector of derivatives.
-        s_dot = torch.zeros((len(idxs), 16 + self.params.num_rotors,), device=self.device)
+        # Pack into vector of derivatives. Use double: a float32 buffer here would truncate every
+        # derivative (e.g. rotor accelerations ~1e4 rad/s^2 lose ~1e-4 abs precision) before the
+        # integrator sees them, which is the dominant batched-vs-NumPy discrepancy (finding F-8).
+        s_dot = torch.zeros((len(idxs), 16 + self.params.num_rotors,), device=self.device, dtype=torch.double)
         s_dot[:, 0:3] = x_dot
         s_dot[:, 3:6] = v_dot
         s_dot[:, 6:10] = q_dot
@@ -1147,9 +1208,11 @@ class BatchedMultirotor(object):
         local_airspeeds = body_airspeed_vector.unsqueeze(-1) + (
             BatchedMultirotor.hat_map(body_rates).permute(2, 0, 1)) @ (self.params.rotor_geometry[idxs].transpose(1, 2))
 
-        # Compute the thrust of each rotor, assuming that the rotors all point in the body z direction!
-        T = torch.zeros(num_drones, 3, 4, device=self.device)
-        T[..., -1, :] = self.params.k_eta[idxs] * rotor_speeds ** 2
+        # Compute the thrust of each rotor (polynomial thrust_c0 + thrust_c1*Omega + k_eta*Omega^2;
+        # reduces to k_eta*Omega^2 by default). Rotors point in the body z direction.
+        T = torch.zeros(num_drones, 3, 4, device=self.device).double()
+        T[..., -1, :] = (self.params.thrust_c0[idxs] + self.params.thrust_c1[idxs] * rotor_speeds
+                         + self.params.k_eta[idxs] * rotor_speeds ** 2)
 
         # Add in aero wrenches (if applicable)
         if self.aero:
@@ -1165,6 +1228,19 @@ class BatchedMultirotor(object):
             M_flap = M_flap @ torch.tensor([0, 0, 1.0], device=self.device).double()
             M_flap = (-self.params.k_flap[idxs] * rotor_speeds).unsqueeze(1) * M_flap.transpose(-1, -2)
 
+            # Thrust correction for rotor angle-of-attack (alpha) and advance ratio (mu); default
+            # inert (per-drone coeffs 0 -> factor 1). Applied before translational lift.
+            if self.params.aoa_active:
+                w_bar = torch.mean(rotor_speeds, dim=1, keepdim=True)
+                denom = self.params.r_prop[idxs] * w_bar
+                vbz = body_airspeed_vector[:, 2:3]
+                v_hor = torch.sqrt(body_airspeed_vector[:, 0:1] ** 2 + body_airspeed_vector[:, 1:2] ** 2)
+                alpha = torch.atan2(vbz, denom)
+                mu = torch.atan2(v_hor, denom)
+                factor = 1.0 + self.params.k_angle[idxs] * alpha + self.params.k_hor[idxs] * mu   # (n,1)
+                T[..., -1, :] = T[..., -1, :] * factor
+                D[:, 2:3] = D[:, 2:3] - self.params.k_v2[idxs] * vbz * torch.abs(vbz)
+
             lift = torch.zeros(num_drones, 3, 1, device=self.device).double()
             lift[:, 2, :] = self.params.k_h[idxs]
             lift = torch.bmm(lift, (local_airspeeds[:, 0, :] ** 2 + local_airspeeds[:, 1, :] ** 2).unsqueeze(1))
@@ -1176,14 +1252,47 @@ class BatchedMultirotor(object):
 
         # Compute the moments due to the rotor thrusts, rotor drag (if applicable), and rotor drag torques
         M_force = -torch.einsum('bijk, bik->bj', self.params.rotor_geometry_hat_maps[idxs], T + H)
-        M_yaw = torch.zeros(num_drones, 3, 4, device=self.device)
-        M_yaw[..., -1, :] = self.params.rotor_dir[idxs] * self.params.k_m[idxs] * rotor_speeds ** 2
+        # Yaw moment per rotor: dir * (torque_c0 + torque_c1*Omega + k_m*Omega^2).
+        M_yaw = torch.zeros(num_drones, 3, 4, device=self.device).double()
+        M_yaw[..., -1, :] = self.params.rotor_dir[idxs] * (self.params.torque_c0[idxs]
+                            + self.params.torque_c1[idxs] * rotor_speeds + self.params.k_m[idxs] * rotor_speeds ** 2)
 
         # Sum all elements to compute the total body wrench
         FtotB = torch.sum(T + H, dim=2) + D
         MtotB = M_force + torch.sum(M_yaw + M_flap, dim=2)
 
         return (FtotB, MtotB)
+
+    def _rotor_inertia_moment(self, w, rotor_speeds, rotor_accel, idxs):
+        """
+        Batched gyroscopic + reaction moment from the spinning rotors (see the single-drone
+        Multirotor.rotor_inertia_moment). Physical spin = -rotor_dir (finding F-6); zero when
+        rotor_inertia == 0. w: (n,3) body rates; rotor_speeds, rotor_accel: (n,4).
+        """
+        I_r = self.params.rotor_inertia[idxs]              # (n,1)
+        spin = -self.params.rotor_dir[idxs]                # (n,4)
+        h_z = I_r * torch.sum(spin * rotor_speeds, dim=1, keepdim=True)   # (n,1)
+        p = w[:, 0:1].double()
+        q = w[:, 1:2].double()
+        M = torch.zeros(len(idxs), 3, device=self.device).double()
+        M[:, 0:1] = -h_z * q
+        M[:, 1:2] = h_z * p
+        M[:, 2:3] = -I_r * torch.sum(spin * rotor_accel, dim=1, keepdim=True)
+        return M
+
+    def _thrust_to_speed(self, forces, idxs):
+        """
+        Invert the thrust curve force -> rotor speed (batched). Default (no poly terms):
+        sign(f)*sqrt(|f|/k_eta), exactly as before. Polynomial active: quadratic-formula root.
+        """
+        if not self.params.thrust_poly_active:
+            s = forces / self.params.k_eta[idxs]
+            return torch.sign(s) * torch.sqrt(torch.abs(s))
+        c0 = self.params.thrust_c0[idxs]
+        c1 = self.params.thrust_c1[idxs]
+        c2 = self.params.k_eta[idxs]
+        disc = torch.clamp(c1 ** 2 - 4.0 * c2 * (c0 - forces), min=0.0)
+        return (-c1 + torch.sqrt(disc)) / (2.0 * c2)
 
     # FIXME(hersh500): since so much of this code is shared with the SE3 Controller, it should really be
     # cleaned up and split into different functions that can be shared across both objects.
@@ -1197,8 +1306,16 @@ class BatchedMultirotor(object):
             # The controller directly controls motor speeds, so command that.
             return control['cmd_motor_speeds'][idxs]
         elif self.control_abstraction == "cmd_motor_thrusts":
-            cmd_motor_speeds = control["cmd_motor_thrusts"][idxs] / self.params.k_eta[idxs]
-            return torch.sign(cmd_motor_speeds) * torch.sqrt(torch.abs(cmd_motor_speeds))
+            return self._thrust_to_speed(control["cmd_motor_thrusts"][idxs], idxs)
+        elif self.control_abstraction == "cmd_motor_throttle":
+            u = torch.clip(control['cmd_motor_throttle'][idxs], 0.0, 1.0).double()
+            levels = self.params.pwm_max[idxs] - self.params.pwm_min[idxs]
+            safe_levels = torch.where(levels > 0, levels, torch.ones_like(levels))
+            u = torch.where(levels > 0, torch.round(u * safe_levels) / safe_levels, u)
+            k = self.params.motor_curve_k[idxs]
+            wmin = self.params.rotor_speed_min[idxs]
+            wmax = self.params.rotor_speed_max[idxs]
+            return (wmax - wmin) * torch.sqrt(k * u ** 2 + (1.0 - k) * u) + wmin
         elif self.control_abstraction == "cmd_ctbm":
             cmd_thrust = control['cmd_thrust'][idxs]
             cmd_moment = control['cmd_moment'][idxs]
@@ -1287,8 +1404,7 @@ class BatchedMultirotor(object):
 
         TM = torch.cat([cmd_thrust, cmd_moment.squeeze(-1)], dim=-1)
         cmd_rotor_thrusts = (self.params.TM_to_f[idxs] @ TM.unsqueeze(1).transpose(-1, -2)).squeeze(-1)
-        cmd_motor_speeds = cmd_rotor_thrusts / self.params.k_eta[idxs]
-        cmd_motor_speeds = torch.sign(cmd_motor_speeds) * torch.sqrt(torch.abs(cmd_motor_speeds))
+        cmd_motor_speeds = self._thrust_to_speed(cmd_rotor_thrusts, idxs)
         return cmd_motor_speeds
 
     @classmethod

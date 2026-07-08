@@ -26,12 +26,21 @@ available) and the NumPy↔batched equivalence test still pass.
 | B1 | Thrust vs angle-of-attack / advance ratio | `vehicles/multirotor.py` | `test_aoa_thrust.py` |
 | A7/C2 | PWM quantization + battery voltage-sag | `vehicles/multirotor.py`, `battery.py` | `test_pwm_battery.py` |
 | D | Extended domain-randomization ranges | `learning/learning_utils.py` | `test_domain_randomization.py` |
+| guard | k_h vs k_angle/k_hor double-count guard | `vehicles/multirotor.py` (both paths) | `test_aoa_kh_guard.py` |
+| xsim | Cross-validation vs Crazyflow & SkyDreamer real code | (Part IV) | `test_xsim_crazyflow.py`, `test_xsim_skydreamer.py` |
+| batched | A2/A3/A4/A5/B1 parity + F-8 float32 fix | `vehicles/multirotor.py` | `test_batched_parity.py` |
+| E2 | Control-rate decoupling (harness, not physics) | `learning/quadrotor_environments.py`, `simulate.py`, `environments.py` | `test_control_rate.py` |
 
-Batched (`BatchedMultirotor`) received the external-wrench hook (C1); the remaining forward-model
-additions (A1–A5, B1) are implemented in the canonical NumPy path only so far and default-equal in
-batched — see per-item "Deferred (batched)" notes. Cross-simulator derivative checks vs the
-SkyDreamer/Crazyflow reference sims (Part III protocol items 3–4) are the next validation step
-before an upstream PR.
+**Cross-simulator validation done** (Part IV): every added component reproduces the reference
+sims' *real running code* (Crazyflow, SkyDreamer) exactly or to a documented epsilon; F-3 and F-4
+confirmed against their code (F-3's flipped axis corrected to x).
+
+**Batched parity done** for C1 (wrench hook) + A2/A3/A4/A5/B1: ported into `BatchedMultirotor`
+and verified to match the canonical NumPy state derivative (relative err < 1e-5, see
+`test_batched_parity.py`). This surfaced and fixed **F-8** (batched ran in float32). Still deferred
+in batched: **A1 per-rotor k_eta/k_m** (needs `(num_drones, num_rotors)` allocation restructuring)
+and A6 command latency (single-drone `step` only). The batched thrust→speed inversion for
+SE3-family abstractions now uses the polynomial-aware `_thrust_to_speed`, matching NumPy.
 
 Environment note: verified under a local venv (`.venv`, numpy 2.5 / torch 2.12 CPU); the two
 skipped repo tests need optional deps (`stable_baselines3`, `foundation_policy`).
@@ -326,8 +335,10 @@ motor model).
 > already computed). New param `rotor_inertia` (kg·m², default 0 → term off). Uses physical spin
 > `spin = −rotor_dir` per F-6. Verified by `scratchpad/tests/test_rotor_inertia.py`: gyro term
 > equals an independent `−ω×h` to 0.0; reaction `−I_r Σ spinΩ̇` exact; balanced-quad invariance;
-> regression-zero at default. **F-3 confirmed numerically**: our gyro y-component is opposite in
-> sign to Crazyflow's — flag in upstream PR + report to Crazyflow.
+> regression-zero at default. **F-3 confirmed against Crazyflow's real code** (see
+> `test_xsim_crazyflow.py`): our gyro **x**-component is opposite in sign to theirs (the initial
+> review mislabeled it as y); reaction(z) and gyro-y agree exactly. Flag in upstream PR + report
+> to Crazyflow.
 > - **Deferred (batched):** term not added to `BatchedMultirotor` yet (no param file sets
 >   rotor_inertia, so batched≡NumPy at default; batched_sims equivalence test still passes).
 
@@ -397,6 +408,15 @@ double-counting the in-plane effect. Gate behind `k_angle = k_hor = 0` defaults.
 > `scratchpad/tests/test_aoa_thrust.py`: regression, zero-airspeed invariance, hand-calc match,
 > and **exact** reproduction of SkyDreamer's `k_w·(1+k_angle·α+k_hor·μ)·ΣΩ²` (err 0). Remember
 > F-4: SkyDreamer k_w is mass-normalized (`k_eta = m·k_w` when porting).
+>
+> **Double-count guard (added 2026-07-07):** `k_h` (translational lift) and `k_hor` both raise
+> thrust with in-plane airspeed (k_angle is the vertical companion of the same model), so enabling
+> `k_h` together with `k_angle` or `k_hor` double-counts. `Multirotor.__init__` now **raises
+> ValueError** for that combination. Verified by `scratchpad/tests/test_aoa_kh_guard.py`: the
+> double count is first demonstrated (both active → horizontal-airspeed thrust increment equals the
+> exact sum of each model's increment, `dT_both = dT_kh + dT_hor`, both nonzero), then the fix is
+> confirmed (construction raises for all three conflicting combos; single-model/neither still
+> build). No shipped param file sets k_angle/k_hor, so no existing vehicle is affected.
 
 ## C. Stochastic disturbance models
 
@@ -467,7 +487,27 @@ Keep the existing hover-feasibility bound on k_η (learning_utils.py:40–53).
 
 Camera models (extrinsics DR, rolling shutter, mask erosion, StochGAN); learning plumbing
 (image delay, rewards, privileged info); firmware controller emulation (Crazyflow Mellinger
-port) and sim/control rate decoupling → firmware repo; MJX contact/ray rendering; CasADi twins.
+port); MJX contact/ray rendering; CasADi twins.
+
+## E2. Control-rate decoupling (approved + implemented 2026-07-07, out of original physics scope)
+
+Not physics (a harness/timing feature), but wanted for training realism: the policy/controller
+decides at a lower rate than physics runs, holding the command zero-order between decisions
+(Crazyflow's `controllable` gate). Distinct from A6 (a fixed command *transport delay*); this is a
+ZOH *staircase* between control updates.
+
+> **STATUS (implemented 2026-07-07):**
+> - Gym env ([quadrotor_environments.py](../rotorpy/learning/quadrotor_environments.py)): new
+>   `control_rate` arg; `n_substep = round(sim_rate/control_rate)`; `step()` loops the physics
+>   `n_substep` times holding the action (ZOH), builds the observation at the decision boundary,
+>   advances `t` by `n_substep·t_step`. Raises if `control_rate > sim_rate`.
+> - `simulate.py` + `Environment`: `control_rate` gate — `control_decimation = round((1/t_step)/
+>   control_rate)`; the controller updates only on decimation boundaries, else the previous command
+>   is held.
+> - Opt-in, default (`control_rate = None → = sim_rate`) reproduces the prior behavior exactly.
+> Verified by `scratchpad/tests/test_control_rate.py`: default trajectory identical; one decoupled
+> step (n=4) equals 4 held physics steps to 0.0; guard fires; `simulate()` holds the command at the
+> 1/decimation rate. A separate observation/IMU rate remains a possible future extension.
 
 ---
 
@@ -496,10 +536,16 @@ porting the F-1/F-2 fixes to the batched path.
 > paths now match an independent closed-form IMU model to < 4e-15 across rotated / offset /
 > mounted cases, and the default config (p_BS=0, R_BS=I) reduces exactly to `Rᵀ(v̇ − g)`, `ω`.
 
-**F-3 ⚠ Crazyflow gyroscopic precession sign** (their `abd/accessor.py` torque_inertia /
-`first_principles/dynamics.py:142–149`): x,y components implemented with the same sign
-`(−q, −p)`; correct is opposite signs `(−q, +p)·h_z` from `τ = −ω×h`. Exactly one axis flipped
-under any spin convention. Flag in our upstream PR and report to Crazyflow.
+**F-3 ⚠ Crazyflow gyroscopic precession sign** (`first_principles/dynamics.py:142–149`): their
+`torque_inertia` writes x and y with the *same* leading sign
+(`x = −I_r·q·S`, `y = −I_r·p·S`, `S = Σ mix_z·Ω`), but `τ = −ω×h` requires *opposite* signs.
+**VERIFIED against their real running code (2026-07-07, `scratchpad/tests/test_xsim_crazyflow.py`):**
+with an identically-configured drone, reaction(z) and gyro-y agree exactly, and gyro-**x** is a
+pure sign flip (`+7.59e-6` vs RotorPy `−7.59e-6`). Hand-check confirms RotorPy equals `−ω×h`, so
+Crazyflow's **x**-component has the wrong sign.
+> **Correction:** the initial review guessed the flipped axis was *y*; running the actual code
+> shows it is *x*. (The identity of which axis depends on the p/q ordering in their expression,
+> which is why the numeric cross-check was needed.) Report to Crazyflow as an x-axis gyro sign bug.
 
 **F-4 ⚠ SkyDreamer coefficients are mass-/inertia-normalized**: their dynamics emits
 accelerations with no `1/m` or `I⁻¹` (impl lines 291–304). All Table II force coefficients are
@@ -515,6 +561,17 @@ Every added spin-dependent term (A5) must use `spin = −rotor_dir`.
 
 **F-7** Genesis reviewed and excluded: no rotor physics beyond `KF·rpm²`/`KM·rpm²` on fixed
 joints; the "gyroscopic effects" attribution is unfounded.
+
+**F-8 ⚠ Batched dynamics ran in float32 (precision)** (`BatchedMultirotor._s_dot_fn`): the state
+derivative buffer was `torch.zeros(..., device=...)` (default float32), truncating every derivative
+to float32 before integration — the dominant source of the batched-vs-NumPy gap (why the repo's
+own test tolerates 5e-2/1.0). Large-magnitude rows (rotor accelerations ~1e4 rad/s²) lost ~1e-4
+absolute precision. Also latent: `torch.tensor(pylist).double()` in param construction rounds to
+float32 *before* upcasting (e.g. `1/0.072 → 13.88888931`). Both fixed during batched parity work.
+> **STATUS:** `s_dot` buffer now `dtype=torch.double`; new params built with `dtype=torch.double`
+> at creation. Batched↔NumPy state-derivative agreement improved from ~1e-4 to ~6e-7 (float32
+> floor still present elsewhere in the pre-existing batched path, e.g. `tau_m`/`k_flap` tensors;
+> not chased). Verified by `scratchpad/tests/test_batched_parity.py`.
 
 ## Test protocol (run everything in RotorPy before any port)
 
@@ -541,7 +598,47 @@ joints; the "gyroscopic effects" attribution is unfounded.
 ## Implementation order
 
 **F-1/F-2 fixes → C1 → A1 → A5 → A3 → A6 → A2 → A4 → B1 → A7/C2 → D** (payoff ÷ effort,
-fixes first because they're bugs).
+fixes first because they're bugs). **All done + unit-verified.** Then cross-sim validation (below).
+
+---
+
+# Part IV — Cross-simulator validation results (2026-07-07)
+
+Beyond the per-item unit tests (which check against published *formulas*), we ran RotorPy against
+the reference simulators' **actual running code**. Both reference sims were executed in the local
+venv: Crazyflow's `first_principles.dynamics` imported via a bare-package shim (bypassing its
+`mujoco.mjx` package init), and SkyDreamer's `compute_dynamics_jit` exec'd verbatim from their
+source with `NUMBA_DISABLE_JIT=1`. Tests: `scratchpad/tests/test_xsim_crazyflow.py`,
+`test_xsim_skydreamer.py`.
+
+### Crazyflow (`test_xsim_crazyflow.py`) — cf2x_L250 params
+| Component | Result |
+|---|---|
+| A2 polynomial thrust | **exact** (err 0) — RotorPy body-z thrust == Crazyflow motor-thrust sum (coeffs RPM→rad/s) |
+| A4 rotor spin-up/down | **exact** (err 0) — `_rotor_accel` == Crazyflow `rotor_vel_dot` for mixed up/down |
+| A5 prop-inertia torque | reaction(z) + gyro-y **exact**; gyro-**x** is a pure sign flip → **F-3 confirmed** |
+
+Isolation method for A5: `τ_inertia = J·(ang_vel_dot[I_r] − ang_vel_dot[0])` from their real
+function (cancels thrust/drag/`ω×Jω`). RotorPy's value hand-verified `= −ω×h`; Crazyflow's x has
+the opposite sign. **This run corrected F-3's axis label (x, not y).**
+
+### SkyDreamer (`test_xsim_skydreamer.py`) — Table II params, mass-scaled per F-4
+| Component | Result |
+|---|---|
+| B1 thrust (AoA + advance ratio + `k_v2`) | **match** to ~1e-6 (their `+1e-6` atan2 epsilon), with `k_eta=m·k_w` etc. |
+| Linear rotor drag | **exact** (err 0) with `k_d = m·k_x` |
+| Quadratic drag | **exact on a single airspeed axis**; **differs off-axis** (RotorPy scales parasitic drag by `‖v‖`, SkyDreamer by per-axis `|v|`) — confirmed numerically, a real structural difference |
+
+**F-4 confirmed**: SkyDreamer emits accelerations (no `1/m`, no `I⁻¹`); RotorPy reproduces their
+forces only after multiplying coefficients by mass. **Not cross-validated (structural mismatch,
+documented):** SkyDreamer's moment model is per-rotor identified `k_p/k_q/k_r` coefficients,
+unlike RotorPy's geometry-derived `r×F`; the two are not expected to agree and were not compared.
+
+### Net
+Every component we added to mirror a reference reproduces that reference's **real code** exactly
+(or to a documented, understood epsilon). The two intentional divergences are both explained:
+Crazyflow's gyro-x sign bug (F-3, ours is correct) and the quadratic-drag norm convention
+(`‖v‖` vs per-axis). This is the evidence base for the upstream PR.
 
 ## Parameter appendix
 

@@ -28,7 +28,7 @@ class ExitStatus(Enum):
     FLY_AWAY     = 'Failure: Your quadrotor is out of control; it flew away with a position error greater than 20 meters.'
     COLLISION    = 'Failure: Your quadrotor collided with an object.'
 
-def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, disturbance_profile=None):
+def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, disturbance_profile=None, control_rate=None):
     """
     Perform a vehicle simulation and return the numerical results.
 
@@ -121,6 +121,15 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
 
     exit_status = None
 
+    # Control-rate decoupling: the controller updates at control_rate while physics steps at
+    # 1/t_step. Between control updates the previous command is held (zero-order hold). Default
+    # (None) => update every physics step (control_decimation = 1), i.e. the original behavior.
+    if control_rate is None:
+        control_decimation = 1
+    else:
+        control_decimation = max(1, int(round((1.0 / t_step) / control_rate)))
+    loop_idx = 0
+
     while True:
         step_start_time = perf_counter()
         exit_status = exit_status or safety_exit(world, safety_margin, state[-1], flat[-1], control[-1])
@@ -128,6 +137,7 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
         exit_status = exit_status or time_exit(time[-1], t_final)
         if exit_status:
             break
+        loop_idx += 1
         time.append(time[-1] + t_step)
         state[-1]['wind'] = wind_profile.update(time[-1], state[-1]['x'])
         # Set the external disturbance wrench for this step (held constant during integration).
@@ -138,10 +148,15 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
         flat.append(trajectory.update(time[-1]))
         mocap_measurements.append(mocap.measurement(state[-1], with_noise=True, with_artifacts=mocap.with_artifacts))
         state_estimate.append(estimator.step(state[-1], control[-1], imu_measurements[-1], mocap_measurements[-1]))
-        if use_mocap:
-            control.append(controller.update(time[-1], mocap_measurements[-1], flat[-1]))
+        if loop_idx % control_decimation == 0:
+            # Controller update boundary: recompute the command.
+            if use_mocap:
+                control.append(controller.update(time[-1], mocap_measurements[-1], flat[-1]))
+            else:
+                control.append(controller.update(time[-1], state[-1], flat[-1]))
         else:
-            control.append(controller.update(time[-1], state[-1], flat[-1]))
+            # Hold the previous command (zero-order hold) between control updates.
+            control.append(control[-1])
         state_dot = vehicle.statedot(state[-1], control[-1], t_step)
         imu_measurements.append(imu.measurement(state[-1], state_dot, with_noise=True))
         imu_gt.append(imu.measurement(state[-1], state_dot, with_noise=False))

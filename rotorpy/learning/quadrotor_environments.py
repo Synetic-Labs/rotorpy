@@ -80,7 +80,8 @@ class QuadrotorEnv(VecEnv):
                  max_time = 10,                         # Maximum time to run the simulation for in a single session.
                  wind_profile = None,                   # wind profile object, if none is supplied it will choose no wind.
                  world        = None,                   # The world object
-                 sim_rate = 100,                        # The update frequency of the simulator in Hz
+                 sim_rate = 100,                        # The physics update frequency of the simulator in Hz
+                 control_rate = None,                   # Policy decision rate in Hz (<= sim_rate). None => equals sim_rate (one physics step per action).
                  aero = True,                           # Whether or not aerodynamic wrenches are computed.
                  render_mode = "None",                  # The rendering mode
                  render_fps = 30,                       # The rendering frames per second. Lower this for faster visualization.
@@ -121,6 +122,18 @@ class QuadrotorEnv(VecEnv):
 
         self.sim_rate = sim_rate
         self.t_step = 1/self.sim_rate
+
+        # Control-rate decoupling: the policy decides at control_rate while physics steps at
+        # sim_rate. One env.step() advances physics by n_substep = sim_rate/control_rate steps,
+        # holding the action constant between decisions (zero-order hold), matching a real firmware
+        # stack where the loop runs faster than the policy. Default (None) => control_rate == sim_rate
+        # => n_substep == 1 (exactly the previous behavior).
+        if control_rate is None:
+            control_rate = sim_rate
+        if control_rate > sim_rate:
+            raise ValueError(f"control_rate ({control_rate}) cannot exceed sim_rate ({sim_rate}).")
+        self.control_rate = control_rate
+        self.n_substep = max(1, int(round(sim_rate / control_rate)))
         self.reward_fn = reward_fn
         self.metadata["render_fps"] = render_fps
 
@@ -354,15 +367,14 @@ class QuadrotorEnv(VecEnv):
         for key in self.control_dict.keys():
             self.control_dict[key] = torch.from_numpy(self.control_dict[key]).to(self.device).double()
 
-        # Now update the wind state using the wind profile
-        self.vehicle_states['wind'] = self.wind_profile.update(self.t, self.vehicle_states['x'])
-
-        # Last perform forward integration using the commanded motor speed and the current state
-        self.vehicle_states = self.quadrotors.step(self.vehicle_states, self.control_dict, self.t_step)
+        # Advance the physics by n_substep steps of t_step, holding the action constant across the
+        # decision interval (zero-order hold). With n_substep == 1 (default) this is a single step.
+        for _ in range(self.n_substep):
+            # Update the wind state using the wind profile at the current physics time.
+            self.vehicle_states['wind'] = self.wind_profile.update(self.t, self.vehicle_states['x'])
+            self.vehicle_states = self.quadrotors.step(self.vehicle_states, self.control_dict, self.t_step)
+            self.t += self.t_step
         pre_termination_obs = self._get_obs()
-
-        # Update t by t_step
-        self.t += self.t_step
 
         # Check for safety
         oob = self._is_out_of_bounds()
