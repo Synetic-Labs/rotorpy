@@ -1,4 +1,5 @@
 from typing import List
+from collections import deque
 import numpy as np
 from numpy.linalg import inv, norm
 import scipy.integrate
@@ -127,16 +128,69 @@ class Multirotor(object):
         self.rotor_speed_min = quad_params['rotor_speed_min'] # rad/s
         self.rotor_speed_max = quad_params['rotor_speed_max'] # rad/s
 
-        self.k_eta           = quad_params['k_eta']     # thrust coeff, N/(rad/s)**2
-        self.k_m             = quad_params['k_m']       # yaw moment coeff, Nm/(rad/s)**2
+        # Thrust and yaw-moment coefficients. Accept either a scalar (shared by all rotors, the
+        # common case) or a per-rotor array of length num_rotors. Real motors/props are unmatched,
+        # so per-rotor coefficients are a key sim-to-real / SkyDreamer-parity axis. Stored
+        # internally as arrays of shape (num_rotors,); a scalar is broadcast, preserving existing
+        # parameter files exactly.
+        self.k_eta           = np.broadcast_to(np.asarray(quad_params['k_eta'], dtype=float), (self.num_rotors,)).copy()  # quadratic thrust coeff c2, N/(rad/s)**2
+        self.k_m             = np.broadcast_to(np.asarray(quad_params['k_m'], dtype=float), (self.num_rotors,)).copy()     # quadratic yaw moment coeff d2, Nm/(rad/s)**2
+
+        # Optional linear + constant terms of the thrust/torque curves (Crazyflow first-principles):
+        #   thrust_i = thrust_c0 + thrust_c1*Omega_i + k_eta*Omega_i^2
+        #   torque_i = torque_c0 + torque_c1*Omega_i + k_m *Omega_i^2   (magnitude; sign from rotor_dir)
+        # All default to 0, so the model reduces exactly to the quadratic k_eta*Omega^2 / k_m*Omega^2.
+        # Each may be a scalar (shared) or a per-rotor array of length num_rotors.
+        self.thrust_c0       = np.broadcast_to(np.asarray(quad_params.get('thrust_c0', 0.0), dtype=float), (self.num_rotors,)).copy()
+        self.thrust_c1       = np.broadcast_to(np.asarray(quad_params.get('thrust_c1', 0.0), dtype=float), (self.num_rotors,)).copy()
+        self.torque_c0       = np.broadcast_to(np.asarray(quad_params.get('torque_c0', 0.0), dtype=float), (self.num_rotors,)).copy()
+        self.torque_c1       = np.broadcast_to(np.asarray(quad_params.get('torque_c1', 0.0), dtype=float), (self.num_rotors,)).copy()
+        # Whether the thrust curve has non-quadratic terms (selects the exact inversion path).
+        self._thrust_poly_active = bool(np.any(self.thrust_c0 != 0.0) or np.any(self.thrust_c1 != 0.0))
         self.k_d             = quad_params.get('k_d', 0.0)       # rotor drag coeff, N/(m/s)
         self.k_z             = quad_params.get('k_z', 0.0)       # induced inflow coeff N/(m/s)
         self.k_h             = quad_params.get('k_h', 0.0)       # translational lift coeff N/(m/s)^2
         self.k_flap          = quad_params.get('k_flap', 0.0)    # Flapping moment coefficient Nm/(m/s)
 
+        # Thrust dependence on rotor angle-of-attack and advance ratio (SkyDreamer B1). All default
+        # to 0 (thrust independent of airspeed beyond k_h/k_z). k_angle, k_hor multiply the rotor
+        # thrust by (1 + k_angle*alpha + k_hor*mu); k_v2 is a collective vertical airspeed-squared
+        # term. r_prop is the propeller radius used to form the inflow angles. NOTE: use either
+        # {k_angle,k_hor} or k_h for the in-plane effect, not both, to avoid double counting.
+        self.k_angle         = quad_params.get('k_angle', 0.0)   # thrust vs rotor angle of attack, dimensionless
+        self.k_hor           = quad_params.get('k_hor', 0.0)     # thrust vs advance-ratio angle, dimensionless
+        self.k_v2            = quad_params.get('k_v2', 0.0)      # collective vertical drag-like coeff, N/(m/s)^2
+        self.r_prop          = quad_params.get('r_prop', quad_params.get('rotor_radius', 0.0))  # propeller radius, m
+
         # Motor parameters
         self.tau_m           = quad_params['tau_m']     # motor reponse time, seconds
         self.motor_noise     = quad_params.get('motor_noise_std', 0) # noise added to the actual motor speed, rad/s / sqrt(Hz)
+        self.rotor_inertia   = quad_params.get('rotor_inertia', 0.0) # moment of inertia of one rotor about its spin axis, kg*m^2 (0 => gyroscopic/reaction torques off)
+        # Optional asymmetric spin-up/spin-down motor dynamics (Crazyflow first-principles):
+        #   Omega_dot = ka1*(Omega_c - Omega) + ka2*(Omega_c^2 - Omega^2)   if Omega_c > Omega (spin-up)
+        #   Omega_dot = kd1*(Omega_c - Omega) + kd2*(Omega_c^2 - Omega^2)   otherwise          (spin-down)
+        # Given as rotor_dyn_coef = [ka1, ka2, kd1, kd2] in RotorPy's rad/s units. When absent, the
+        # motor uses the first-order lag 1/tau_m (recovered exactly by [1/tau_m, 0, 1/tau_m, 0]).
+        rotor_dyn_coef = quad_params.get('rotor_dyn_coef', None)
+        self.rotor_dyn_coef = None if rotor_dyn_coef is None else np.asarray(rotor_dyn_coef, dtype=float)
+        self._rotor_dyn_active = self.rotor_dyn_coef is not None
+        # Shape of the normalized-throttle -> steady-state-speed curve for the 'cmd_motor_throttle'
+        # abstraction (SkyDreamer). k in [0,1]: k=1 is a linear speed map; k=0 is a sqrt curve
+        # (linear-in-thrust ESC). SkyDreamer identified k=0.5 for a 5" racer.
+        self.motor_curve_k   = quad_params.get('motor_curve_k', 1.0)
+        # Pure transport delay on the commanded control (RC link + ESC + loop latency), seconds.
+        # 0 => no delay (default). Implemented as a per-step command delay line in step().
+        self.motor_delay_time = quad_params.get('motor_delay_time', 0.0)
+        self._cmd_buffer = None
+
+        # PWM command quantization for the 'cmd_motor_throttle' abstraction. When pwm_max > pwm_min
+        # the normalized throttle u is snapped to the integer PWM grid (real ESCs are quantized).
+        # Defaults (0,0) => no quantization.
+        self.pwm_min          = quad_params.get('pwm_min', 0.0)
+        self.pwm_max          = quad_params.get('pwm_max', 0.0)
+        # Battery sag hook: a multiplicative scale on the achievable maximum rotor speed, set
+        # externally each step by a battery model (see rotorpy/battery.py). 1.0 => full battery.
+        self.rotor_speed_max_scale = 1.0
 
         # Lower level controller parameters 
         self.k_w             = quad_params.get('k_w', 1)            # The body rate P gain        (for cmd_ctbr)
@@ -179,7 +233,15 @@ class Multirotor(object):
 
         self.aero = aero
 
-        # Integrator settings. 
+        # External disturbance wrench, held constant across an integration step (resample-and-hold).
+        # Set externally each step by a disturbance profile (see rotorpy/disturbances/); zero by
+        # default so dynamics are unchanged. Force is in the world frame (N), torque in the body
+        # frame (N*m). Keeping these as attributes (rather than state) leaves the ODE deterministic
+        # for a given step.
+        self.external_force = np.zeros(3)
+        self.external_torque = np.zeros(3)
+
+        # Integrator settings.
         if integrator_kwargs is None:
             self.integrator_kwargs = {'method':'RK45'}
         else:
@@ -223,15 +285,35 @@ class Multirotor(object):
         return state_dot 
 
 
+    def _apply_command_delay(self, control, t_step):
+        """
+        Apply a pure transport delay to the commanded control: the control used at this step is
+        the one commanded round(motor_delay_time / t_step) steps ago. Returns the control unchanged
+        (and touches no state) when motor_delay_time == 0, so nominal behavior is identical.
+
+        During the initial fill of the delay line, the earliest command is held (a standard
+        zero-order startup). The delay line advances once per step() call.
+        """
+        n_delay = int(round(self.motor_delay_time / t_step)) if self.motor_delay_time > 0 else 0
+        if n_delay <= 0:
+            return control
+        if self._cmd_buffer is None or self._cmd_buffer.maxlen != n_delay + 1:
+            self._cmd_buffer = deque(maxlen=n_delay + 1)
+        self._cmd_buffer.append(control)
+        return self._cmd_buffer[0]   # oldest entry: n_delay steps back once the line is full
+
     def step(self, state, control, t_step):
         """
         Integrate dynamics forward from state given constant control for time t_step.
         """
 
+        control = self._apply_command_delay(control, t_step)
         cmd_rotor_speeds = self.get_cmd_motor_speeds(state, control)
 
-        # The true motor speeds can not fall below min and max speeds.
-        cmd_rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, self.rotor_speed_max)
+        # The true motor speeds can not fall below min or above max. The max is scaled by the
+        # current battery state (rotor_speed_max_scale, 1.0 by default) to model voltage sag.
+        effective_max = self.rotor_speed_max * self.rotor_speed_max_scale
+        cmd_rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, effective_max)
 
         # Form autonomous ODE for constant inputs and integrate one time step.
         def s_dot_fn(t, s):
@@ -259,7 +341,7 @@ class Multirotor(object):
 
         # Add noise to the motor speed measurement
         state['rotor_speeds'] += np.random.normal(scale=np.abs(self.motor_noise), size=(self.num_rotors,))
-        state['rotor_speeds'] = np.clip(state['rotor_speeds'], self.rotor_speed_min, self.rotor_speed_max)
+        state['rotor_speeds'] = np.clip(state['rotor_speeds'], self.rotor_speed_min, effective_max)
 
         return state
 
@@ -277,8 +359,8 @@ class Multirotor(object):
 
         R = Rotation.from_quat(state['q']).as_matrix()
 
-        # Rotor speed derivative
-        rotor_accel = (1/self.tau_m)*(cmd_rotor_speeds - rotor_speeds)
+        # Rotor speed derivative (first-order lag, or asymmetric spin-up/spin-down if configured)
+        rotor_accel = self._rotor_accel(cmd_rotor_speeds, rotor_speeds)
 
         # Position derivative.
         x_dot = state['v']
@@ -292,8 +374,12 @@ class Multirotor(object):
         # Compute total wrench in the body frame based on the current rotor speeds and their location w.r.t. CoM
         (FtotB, MtotB) = self.compute_body_wrench(state['w'], rotor_speeds, body_airspeed_vector)
 
-        # Rotate the force from the body frame to the inertial frame
-        Ftot = R@FtotB
+        # Add the gyroscopic + reaction moments from the spinning rotors (zero if rotor_inertia == 0).
+        MtotB = MtotB + self.rotor_inertia_moment(state['w'], rotor_speeds, rotor_accel)
+
+        # Rotate the force from the body frame to the inertial frame, then add the external
+        # disturbance force (world frame, zero by default).
+        Ftot = R@FtotB + self.external_force
 
         # Ground reaction force: apply normal force when on ground to prevent penetration
         if self._enable_ground and self._on_ground(state):
@@ -305,10 +391,10 @@ class Multirotor(object):
         # Velocity derivative.
         v_dot = (self.weight + Ftot) / self.mass
 
-        # Angular velocity derivative.
+        # Angular velocity derivative. Add the external disturbance torque (body frame, zero by default).
         w = state['w']
         w_hat = Multirotor.hat_map(w)
-        w_dot = self.inv_inertia @ (MtotB - w_hat @ (self.inertia @ w))
+        w_dot = self.inv_inertia @ (MtotB + self.external_torque - w_hat @ (self.inertia @ w))
 
         # NOTE: the wind dynamics are currently handled in the wind_profile object. 
         # The line below doesn't do anything, as the wind state is assigned elsewhere. 
@@ -338,8 +424,11 @@ class Multirotor(object):
         local_airspeeds = body_airspeed_vector[:, np.newaxis] + Multirotor.hat_map(body_rates)@(self.rotor_geometry.T)
 
         # Compute the thrust of each rotor, assuming that the rotors all point in the body z direction!
-        T = np.array([0, 0, self.k_eta])[:, np.newaxis]*rotor_speeds**2 
-        
+        # Polynomial curve thrust_c0 + thrust_c1*Omega + k_eta*Omega^2 (reduces to k_eta*Omega^2 by default).
+        # Coefficients are per-rotor (shape (num_rotors,)); build the (3, num_rotors) thrust array explicitly.
+        T = np.zeros((3, self.num_rotors))
+        T[2, :] = self.thrust_c0 + self.thrust_c1 * rotor_speeds + self.k_eta * rotor_speeds**2
+
         # Add in aero wrenches (if applicable)
         if self.aero:
             # Parasitic drag force acting at the CoM
@@ -349,7 +438,23 @@ class Multirotor(object):
 
             # Pitching flapping moment acting at each propeller hub.
             M_flap = -self.k_flap*rotor_speeds*((Multirotor.hat_map(local_airspeeds.T).transpose(2, 0, 1))@np.array([0,0,1])).T
-            # Translational lift. 
+
+            # Thrust correction for rotor angle-of-attack (alpha) and advance ratio (mu),
+            # multiplying the base rotor thrust by (1 + k_angle*alpha + k_hor*mu). Default inert
+            # (k_angle = k_hor = 0). Applied before translational lift so it scales only the
+            # base thrust, matching SkyDreamer's k_w*(...)*sum Omega^2 form.
+            if self.k_angle != 0.0 or self.k_hor != 0.0:
+                w_bar = np.mean(rotor_speeds)
+                denom = self.r_prop * w_bar
+                alpha = np.arctan2(body_airspeed_vector[2], denom)
+                mu = np.arctan2(np.hypot(body_airspeed_vector[0], body_airspeed_vector[1]), denom)
+                T[2, :] = T[2, :] * (1.0 + self.k_angle*alpha + self.k_hor*mu)
+            # Collective vertical airspeed-squared term (acts at the CoM along body z).
+            if self.k_v2 != 0.0:
+                vaz = body_airspeed_vector[2]
+                D = D + np.array([0.0, 0.0, -self.k_v2 * vaz * abs(vaz)])
+
+            # Translational lift.
             T += np.array([0, 0, self.k_h])[:, np.newaxis]*(local_airspeeds[0, :]**2 + local_airspeeds[1, :]**2)
 
         else:
@@ -359,7 +464,10 @@ class Multirotor(object):
 
         # Compute the moments due to the rotor thrusts, rotor drag (if applicable), and rotor drag torques
         M_force = -np.einsum('ijk, ik->j', Multirotor.hat_map(self.rotor_geometry), T+H)
-        M_yaw = self.rotor_dir*(np.array([0, 0, self.k_m])[:, np.newaxis]*rotor_speeds**2)
+        # Yaw moment per rotor: dir_i * (torque_c0 + torque_c1*Omega_i + k_m_i*Omega_i^2).
+        # Reduces to dir_i * k_m_i * Omega_i^2 by default. Coefficients are per-rotor.
+        M_yaw = np.zeros((3, self.num_rotors))
+        M_yaw[2, :] = self.rotor_dir * (self.torque_c0 + self.torque_c1 * rotor_speeds + self.k_m * rotor_speeds**2)
 
         # Sum all elements to compute the total body wrench
         FtotB = np.sum(T + H, axis=1) + D
@@ -367,21 +475,93 @@ class Multirotor(object):
 
         return (FtotB, MtotB)
 
+    def rotor_inertia_moment(self, body_rates, rotor_speeds, rotor_accel):
+        """
+        Body-frame moment from the angular momentum of the spinning rotors:
+          - reaction torque (yaw) opposing rotor angular acceleration, and
+          - gyroscopic precession (roll/pitch) as the body rotation carries the rotor spin axes.
+        Both vanish for balanced counter-rotating rotors at constant speed, and are exactly zero
+        when rotor_inertia == 0 (the default), so this leaves nominal dynamics unchanged.
+
+        Convention: the physical spin direction is spin_i = -rotor_dir_i, because rotor_dir encodes
+        the sign of the aerodynamic *yaw torque* a rotor produces, which is opposite to its spin
+        (finding F-6). Derivation: the reaction torque on the airframe is tau = -d/dt(h)|_inertial
+        with net rotor angular momentum h = I_r * (sum_i spin_i * Omega_i) * zhat, and
+        d/dt(h)|_inertial = I_r * (sum_i spin_i * Omega_dot_i) * zhat + omega x h.
+        With omega x zhat = (q, -p, 0), the gyroscopic part is -h_z * (q, -p, 0) = (-h_z q, h_z p, 0).
+        """
+        if self.rotor_inertia == 0.0:
+            return np.zeros(3)
+        p, q, _r = body_rates
+        spin = -self.rotor_dir
+        h_z = self.rotor_inertia * np.sum(spin * rotor_speeds)   # net rotor angular momentum about +z_body
+        # Gyroscopic precession (roll/pitch): -omega x (h_z zhat).
+        M_gyro = np.array([-h_z * q, h_z * p, 0.0])
+        # Reaction torque (yaw): -I_r * sum_i spin_i * Omega_dot_i.
+        M_reaction_z = -self.rotor_inertia * np.sum(spin * rotor_accel)
+        return M_gyro + np.array([0.0, 0.0, M_reaction_z])
+
+    def _rotor_accel(self, cmd_rotor_speeds, rotor_speeds):
+        """
+        Rotor angular acceleration Omega_dot for the motor model.
+
+        Default: first-order lag (Omega_c - Omega)/tau_m. When rotor_dyn_coef is set, use the
+        asymmetric spin-up/spin-down model with separate coefficients for the accelerating and
+        decelerating branches (motors typically brake more slowly than they spin up).
+        """
+        if not self._rotor_dyn_active:
+            return (1.0 / self.tau_m) * (cmd_rotor_speeds - rotor_speeds)
+        ka1, ka2, kd1, kd2 = self.rotor_dyn_coef
+        d = cmd_rotor_speeds - rotor_speeds
+        dsq = cmd_rotor_speeds**2 - rotor_speeds**2
+        return np.where(cmd_rotor_speeds > rotor_speeds, ka1*d + ka2*dsq, kd1*d + kd2*dsq)
+
+    def _thrust_to_speed(self, forces):
+        """
+        Invert the per-rotor thrust curve: force -> rotor speed.
+
+        Default (pure quadratic, no linear/constant terms): sign(f)*sqrt(|f|/k_eta), preserving
+        the original behavior exactly, including the sign convention for the (nonphysical) negative
+        per-motor forces the SE3 allocation can request transiently.
+
+        Polynomial curve active: solve thrust_c0 + thrust_c1*w + k_eta*w^2 = f for w >= 0 via the
+        quadratic formula (Crazyflow's motor_force2rotor_vel), taking the physical (increasing)
+        root and clamping the discriminant at 0.
+        """
+        forces = np.asarray(forces, dtype=float)
+        if not self._thrust_poly_active:
+            s = forces / self.k_eta
+            return np.sign(s) * np.sqrt(np.abs(s))
+        disc = self.thrust_c1**2 - 4.0*self.k_eta*(self.thrust_c0 - forces)
+        disc = np.clip(disc, 0.0, None)
+        return (-self.thrust_c1 + np.sqrt(disc)) / (2.0*self.k_eta)
+
     def get_cmd_motor_speeds(self, state, control):
         """
         Computes the commanded motor speeds depending on the control abstraction.
-        For higher level control abstractions, we have low-level controllers that will produce motor speeds based on the higher level commmand. 
+        For higher level control abstractions, we have low-level controllers that will produce motor speeds based on the higher level commmand.
 
         """
 
         if self.control_abstraction == 'cmd_motor_speeds':
-            # The controller directly controls motor speeds, so command that. 
+            # The controller directly controls motor speeds, so command that.
             return control['cmd_motor_speeds']
 
         elif self.control_abstraction == 'cmd_motor_thrusts':
-            # The controller commands individual motor forces. 
-            cmd_motor_speeds = control['cmd_motor_thrusts'] / self.k_eta                        # Convert to motor speeds from thrust coefficient. 
-            return np.sign(cmd_motor_speeds) * np.sqrt(np.abs(cmd_motor_speeds))
+            # The controller commands individual motor forces.
+            return self._thrust_to_speed(control['cmd_motor_thrusts'])
+
+        elif self.control_abstraction == 'cmd_motor_throttle':
+            # The controller commands normalized per-motor throttle u in [0, 1]. This is the
+            # command path of a real ESC+battery: throttle maps nonlinearly to steady-state speed
+            # (SkyDreamer). w_c = (w_max - w_min)*sqrt(k*u^2 + (1-k)*u) + w_min.
+            u = np.clip(np.asarray(control['cmd_motor_throttle'], dtype=float), 0.0, 1.0)
+            # Optional PWM quantization: snap u to the integer PWM grid (real ESCs are quantized).
+            if self.pwm_max > self.pwm_min:
+                levels = self.pwm_max - self.pwm_min
+                u = np.round(u * levels) / levels
+            k = self.motor_curve_k
+            return (self.rotor_speed_max - self.rotor_speed_min) * np.sqrt(k*u**2 + (1.0 - k)*u) + self.rotor_speed_min
 
         elif self.control_abstraction == 'cmd_ctbm':
             # The controller commands collective thrust and moment on each axis. 
@@ -471,13 +651,15 @@ class Multirotor(object):
             # Angular control; vector units of N*m.
             cmd_moment = self.inertia @ (-self.kp_att*att_err - self.kd_att*state['w']) + np.cross(state['w'], self.inertia@state['w'])
         else:
-            raise ValueError("Invalid control abstraction selected. Options are: cmd_motor_speeds, cmd_motor_thrusts, cmd_ctbm, cmd_ctbr, cmd_ctatt, cmd_vel, cmd_acc")
+            raise ValueError("Invalid control abstraction selected. Options are: cmd_motor_speeds, cmd_motor_thrusts, cmd_motor_throttle, cmd_ctbm, cmd_ctbr, cmd_ctatt, cmd_vel, cmd_acc")
 
         # Take the commanded thrust and body moments and convert them to motor speeds
         TM = np.concatenate(([cmd_thrust], cmd_moment))               # Concatenate thrust and moment into an array
         cmd_motor_forces = self.TM_to_f @ TM                                                # Convert to cmd_motor_forces from allocation matrix
-        cmd_motor_speeds = cmd_motor_forces / self.k_eta                                    # Convert to motor speeds from thrust coefficient. 
-        cmd_motor_speeds = np.sign(cmd_motor_speeds) * np.sqrt(np.abs(cmd_motor_speeds))
+        cmd_motor_speeds = self._thrust_to_speed(cmd_motor_forces)                          # Invert the (per-rotor, possibly polynomial) thrust curve
+        # NOTE: the linear allocator TM_to_f assumes a quadratic-dominant thrust/torque model; when
+        # a polynomial curve (thrust_c0/c1, torque_c0/c1) is active the force->speed inversion is
+        # exact but the thrust/moment split is approximate. The forward dynamics remain exact.
 
         return cmd_motor_speeds
 
@@ -803,6 +985,12 @@ class BatchedMultirotor(object):
 
         self.aero = aero
 
+        # External disturbance wrench (world-frame force N, body-frame torque N*m), per drone,
+        # held constant across an integration step. Zero by default so dynamics are unchanged.
+        # See the single-drone Multirotor for rationale.
+        self.external_force = torch.zeros(num_drones, 3, device=device).double()
+        self.external_torque = torch.zeros(num_drones, 3, device=device).double()
+
         assert integrator == 'dopri5' or integrator == "rk4"
         self.integrator = integrator
 
@@ -914,17 +1102,19 @@ class BatchedMultirotor(object):
         # Compute total wrench in the body frame based on the current rotor speeds and their location w.r.t. CoM
         (FtotB, MtotB) = self.compute_body_wrench(state['w'][idxs], rotor_speeds, body_airspeed_vector, idxs)
 
-        # Rotate the force from the body frame to the inertial frame
+        # Rotate the force from the body frame to the inertial frame, then add the external
+        # disturbance force (world frame, zero by default).
         Ftot = R @ FtotB.unsqueeze(-1)
+        Ftot = Ftot.squeeze(-1) + self.external_force[idxs]
 
         # Velocity derivative.
-        v_dot = (self.params.weight[idxs] + Ftot.squeeze(-1)) / self.params.mass[idxs]
+        v_dot = (self.params.weight[idxs] + Ftot) / self.params.mass[idxs]
 
-        # Angular velocity derivative.
+        # Angular velocity derivative. Add the external disturbance torque (body frame, zero by default).
         w = state['w'][idxs].double()
         w_hat = BatchedMultirotor.hat_map(w).permute(2, 0, 1)
         w_dot = self.params.inv_inertia[idxs] @ (
-                    MtotB - (w_hat.double() @ (self.params.inertia[idxs] @ w.unsqueeze(-1))).squeeze(-1)).unsqueeze(-1)
+                    MtotB + self.external_torque[idxs] - (w_hat.double() @ (self.params.inertia[idxs] @ w.unsqueeze(-1))).squeeze(-1)).unsqueeze(-1)
 
         # NOTE: the wind dynamics are currently handled in the wind_profile object.
         # The line below doesn't do anything, as the wind state is assigned elsewhere.

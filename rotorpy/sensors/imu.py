@@ -4,7 +4,6 @@ try:
     import torch
 except ImportError:
     pass
-import copy
 
 class Imu:
     """
@@ -97,25 +96,27 @@ class Imu:
                 gyro, simulated gyroscope measurement, rad/s^2, shape=(3,)
         """
         q_WB = state['q']
-        w_WB = state['w']
-        alpha_WB_W = acceleration['wdot']
-        a_WB_W = acceleration['vdot']
+        w_WB = state['w']                    # body-frame angular velocity, rad/s
+        alpha_WB_B = acceleration['wdot']    # body-frame angular acceleration (Multirotor.statedot returns wdot in the body frame)
+        a_WB_W = acceleration['vdot']        # world-frame linear acceleration of the body-frame origin
 
         # Rotation matrix of the body frame B in world frame W
         R_WB = Rotation.from_quat(q_WB).as_matrix()
 
-        # Sensor position in body frame expressed in world coordinates
-        p_BS_W = R_WB @ self.p_BS
+        # Linear acceleration of the sensor point S. The rotational contribution
+        # (Euler term alpha x r plus centripetal term w x (w x r)) is formed in the
+        # body frame -- where w, wdot and the lever arm p_BS all live -- and then
+        # rotated into the world frame. Mixing a body-frame w with a world-frame
+        # lever arm (the previous behavior) is only correct when p_BS = 0.
+        a_rot_B = np.cross(alpha_WB_B, self.p_BS) + np.cross(w_WB, np.cross(w_WB, self.p_BS))
+        a_WS_W = a_WB_W + R_WB @ a_rot_B
 
-        # Linear acceleration of point S (the imu) expressed in world coordinates W.
-        a_WS_W = a_WB_W + np.cross(alpha_WB_W, p_BS_W) + np.cross(w_WB, np.cross(w_WB, p_BS_W))
-
-        # Rotation from world to imu: R_SW = R_SB * R_BW
+        # Rotation from world to sensor frame: R_SW = R_SB * R_BW
         R_SW = self.R_BS.T @ R_WB.T
 
-        # Rotate to local frame
+        # Rotate specific force into the sensor frame; express body rates in the sensor frame.
         accelerometer_measurement = R_SW @ (a_WS_W - self.gravity_vector)
-        gyroscope_measurement = copy.deepcopy(w_WB).astype(float)
+        gyroscope_measurement = self.R_BS.T @ w_WB.astype(float)
 
         # Add the bias drift (default 0)
         self.bias_step()
@@ -181,29 +182,34 @@ class BatchedImu:
         if idxs is None:
             idxs = [i for i in range(self.num_drones)]
 
-        q_WB = state['q'][idxs]  # (num_drones, 4)
-        w_WB = state['w'][idxs]
-        alpha_WB_W = acceleration['wdot'][idxs]
-        a_WB_W = acceleration['vdot'][idxs]
+        q_WB = state['q'][idxs]              # (num_drones, 4)
+        w_WB = state['w'][idxs]              # body-frame angular velocity, rad/s
+        alpha_WB_B = acceleration['wdot'][idxs]   # body-frame angular acceleration (Multirotor.statedot returns wdot in the body frame)
+        a_WB_W = acceleration['vdot'][idxs]       # world-frame linear acceleration of the body-frame origin
 
         # Get rotation matrices from quaternions (num_drones, 3, 3)
         R_WB = self.quat_to_rotmat(q_WB)
 
-        # Sensor offset in world frame
-        p_BS_W = torch.einsum('bij,j->bi', R_WB, self.p_BS)
-
-        cross_w_p = torch.cross(w_WB, p_BS_W, dim=-1)
+        # Linear acceleration of the sensor point S. The rotational contribution is
+        # formed in the body frame (where w, wdot and p_BS live) and then rotated to
+        # the world frame, matching the single-drone Imu.measurement path.
+        p_BS = self.p_BS.expand_as(w_WB)
+        cross_w_p = torch.cross(w_WB, p_BS, dim=-1)
         cross_w_w_p = torch.cross(w_WB, cross_w_p, dim=-1)
-        cross_alpha_p = torch.cross(alpha_WB_W, p_BS_W, dim=-1)
-        a_WS_W = a_WB_W + cross_alpha_p + cross_w_w_p
+        cross_alpha_p = torch.cross(alpha_WB_B, p_BS, dim=-1)
+        a_rot_B = cross_alpha_p + cross_w_w_p
+        a_WS_W = a_WB_W + torch.einsum('bij,bj->bi', R_WB, a_rot_B)
 
-        R_SW = torch.einsum('ij,bij->bij', self.R_BS.T, R_WB.transpose(1, 2))
+        # Rotation from world to sensor frame: R_SW = R_SB @ R_BW (proper matrix product).
+        R_SW = torch.einsum('ik,bkj->bij', self.R_BS.T, R_WB.transpose(1, 2))
         a_WS_S = torch.einsum('bij,bj->bi', R_SW, a_WS_W - self.gravity_vector)
 
         # Apply bias + noise
         self.bias_step()
         a_meas = a_WS_S + self.accel_bias[idxs]
-        w_meas = w_WB + self.gyro_bias[idxs]
+        # Express body rates in the sensor frame before adding bias/noise.
+        w_WB_S = torch.einsum('ij,bj->bi', self.R_BS.T, w_WB.double())
+        w_meas = w_WB_S + self.gyro_bias[idxs]
 
         if with_noise:
             a_meas += self.rate_scale * torch.randn_like(a_meas) * self.accel_noise

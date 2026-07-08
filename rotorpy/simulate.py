@@ -14,6 +14,7 @@ from time import perf_counter
 import rotorpy.wind
 from rotorpy.controllers.quadrotor_control import BatchedSE3Control
 from rotorpy.vehicles.multirotor import BatchedMultirotor
+from rotorpy.disturbances.default_disturbances import NoDisturbance
 
 
 class ExitStatus(Enum):
@@ -27,7 +28,7 @@ class ExitStatus(Enum):
     FLY_AWAY     = 'Failure: Your quadrotor is out of control; it flew away with a position error greater than 20 meters.'
     COLLISION    = 'Failure: Your quadrotor collided with an object.'
 
-def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False):
+def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, disturbance_profile=None):
     """
     Perform a vehicle simulation and return the numerical results.
 
@@ -96,9 +97,12 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
     else:                    # Custom exit.
         normal_exit = terminate
 
+    if disturbance_profile is None:
+        disturbance_profile = NoDisturbance()
+
     time    = [0]
     state   = [copy.deepcopy(initial_state)]
-    state[0]['wind'] = wind_profile.update(0, state[0]['x'])   # TODO: move this line elsewhere so that other objects that don't have wind as a state can work here. 
+    state[0]['wind'] = wind_profile.update(0, state[0]['x'])   # TODO: move this line elsewhere so that other objects that don't have wind as a state can work here.
     imu_measurements = []
     mocap_measurements = []
     imu_gt = []
@@ -126,6 +130,10 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
             break
         time.append(time[-1] + t_step)
         state[-1]['wind'] = wind_profile.update(time[-1], state[-1]['x'])
+        # Set the external disturbance wrench for this step (held constant during integration).
+        disturbance = disturbance_profile.update(time[-1], state[-1])
+        vehicle.external_force = disturbance['force']
+        vehicle.external_torque = disturbance['torque']
         state.append(vehicle.step(state[-1], control[-1], t_step))
         flat.append(trajectory.update(time[-1]))
         mocap_measurements.append(mocap.measurement(state[-1], with_noise=True, with_artifacts=mocap.with_artifacts))

@@ -7,6 +7,35 @@ Part III records verification findings and the test protocol. Everything is fram
 ready to port to the compiled custom-firmware repo; candidate items also go upstream to RotorPy
 as PRs for author review.
 
+## Implementation status (2026-07-07) — all items landed + verified
+
+Every addition is opt-in / zero-by-default, so nominal RotorPy behavior is bit-identical; each has
+a standalone verification script in `scratchpad/tests/`. Repo regression suite (15 tests w/ deps
+available) and the NumPy↔batched equivalence test still pass.
+
+| ID | Item | Files | Test |
+|---|---|---|---|
+| F-1/F-2/F-2b | IMU frame fixes (lever arm, gyro mount, batched R_SW matmul) | `sensors/imu.py` | `test_imu_fixes.py` |
+| C1 | Two-band external-wrench disturbance | `disturbances/`, `vehicles/multirotor.py`, `simulate.py`, `environments.py` | `test_wrench_disturbance.py` |
+| A1 | Per-rotor thrust/torque coefficients | `vehicles/multirotor.py` | `test_per_rotor_coeffs.py` |
+| A5 | Rotor-inertia reaction + gyroscopic precession | `vehicles/multirotor.py` | `test_rotor_inertia.py` |
+| A3 | Nonlinear throttle-curve abstraction (`cmd_motor_throttle`) | `vehicles/multirotor.py` | `test_throttle_curve.py` |
+| A6 | Motor command latency (delay line) | `vehicles/multirotor.py` | `test_command_delay.py` |
+| A2 | Polynomial thrust/torque curves | `vehicles/multirotor.py` | `test_poly_thrust.py` |
+| A4 | Asymmetric spin-up/spin-down motor dynamics | `vehicles/multirotor.py` | `test_motor_dynamics.py` |
+| B1 | Thrust vs angle-of-attack / advance ratio | `vehicles/multirotor.py` | `test_aoa_thrust.py` |
+| A7/C2 | PWM quantization + battery voltage-sag | `vehicles/multirotor.py`, `battery.py` | `test_pwm_battery.py` |
+| D | Extended domain-randomization ranges | `learning/learning_utils.py` | `test_domain_randomization.py` |
+
+Batched (`BatchedMultirotor`) received the external-wrench hook (C1); the remaining forward-model
+additions (A1–A5, B1) are implemented in the canonical NumPy path only so far and default-equal in
+batched — see per-item "Deferred (batched)" notes. Cross-simulator derivative checks vs the
+SkyDreamer/Crazyflow reference sims (Part III protocol items 3–4) are the next validation step
+before an upstream PR.
+
+Environment note: verified under a local venv (`.venv`, numpy 2.5 / torch 2.12 CPU); the two
+skipped repo tests need optional deps (`stable_baselines3`, `foundation_policy`).
+
 **Verification legend:**
 - ✅ math checked against the implementation *and* a published source / independent derivation
 - ⚠️ issue found — see Part III findings
@@ -196,6 +225,17 @@ etc. Their lumped `J_x·q·r` terms are RotorPy's `−ω×Iω` (already present 
 verified: `J_x=(I_yy−I_zz)/I_xx<0`, `J_y=(I_zz−I_xx)/I_yy>0` ✓); do not add twice.
 **RotorPy site:** wrench (:341,362) + allocation `TM_to_f`; defaults identical per rotor.
 
+> **STATUS (implemented 2026-07-07):** `Multirotor` (NumPy, canonical) now stores `k_eta`, `k_m`
+> as per-rotor arrays of shape (num_rotors,); a scalar in the params dict is broadcast, so every
+> existing parameter file is unchanged. Thrust, yaw moment, the `k = k_m/k_eta` allocation ratio,
+> and the force→speed inversion are all element-wise per rotor. Verified by
+> `scratchpad/tests/test_per_rotor_coeffs.py`: scalar-broadcast reproduces hover exactly;
+> asymmetric k_eta matches a hand-computed `Σ r_i×T_i`; cmd_ctbm allocation round-trip recovers
+> commanded thrust+moment to ~1e-18 with per-rotor k_eta and k_m. Repo tests
+> (test_multirotor/sensors/env/winds/batched_sims) pass.
+> - **Deferred (batched):** `BatchedMultirotorParams` keeps one k_eta/k_m per drone (broadcast
+>   over rotors) — per-rotor arrays in the batched path are a follow-up; NumPy is canonical.
+
 ### A2. Polynomial thrust/torque curves ✅(source-verified)
 **Source:** Crazyflow `first_principles/dynamics.py:121,129`; identified in `params.toml`.
 ```
@@ -206,6 +246,17 @@ Identified (Crazyflie, **RPM units** — convert: `c₁^rad/s = c₁·60/2π`, `
 cf2x_L250 thrust `[0, −5.382e-7, 2.458e-10]`, torque `[0, 1.410e-9, 1.459e-12]`; 3 more variants
 in params.toml. Quadratic-formula inversion verified (positive root ✓).
 **RotorPy site:** params `k_eta → [c₀,c₁,c₂]` default `[0,0,k_η]`; wrench + inversions :384/:480.
+
+> **STATUS (implemented 2026-07-07):** Forward thrust `thrust_c0 + thrust_c1·Ω + k_eta·Ω²` and
+> yaw `dir·(torque_c0 + torque_c1·Ω + k_m·Ω²)` in `compute_body_wrench` (k_eta/k_m are the
+> quadratic c2/d2; new optional params `thrust_c0/c1`, `torque_c0/c1`, per-rotor or scalar,
+> default 0). Inversion refactored into `_thrust_to_speed`: exact `sign·√(f/k_eta)` when no poly
+> terms (regression), quadratic-formula root (Crazyflow) when active; used by `cmd_motor_thrusts`
+> and the SE3 allocation. Verified by `scratchpad/tests/test_poly_thrust.py`: regression, poly
+> forward vs hand calc, exact w→f→w round-trip (4e-13) on the physical branch, and **exact
+> Crazyflow parity** (cf2x_L250 rpm2thrust converted RPM→rad/s, err ~1e-18). **Caveat:** the linear
+> allocator TM_to_f assumes quadratic-dominant; with a polynomial active the thrust/moment split
+> is approximate (forward dynamics exact) — documented at the allocation site.
 
 ### A3. Nonlinear command→steady-state speed curve ✅(source-verified)
 **Source:** SkyDreamer paper Eq. (motor model) + impl lines 253–256.
@@ -218,6 +269,15 @@ state over a fixed [0, 3000] rad/s range (lines 243–246, 306–309) — an imp
 not physics; port the physical form above.
 **RotorPy site:** new control abstraction in `get_cmd_motor_speeds`.
 
+> **STATUS (implemented 2026-07-07):** New `cmd_motor_throttle` control abstraction in
+> `get_cmd_motor_speeds`; command `u∈[0,1]` per rotor mapped via the curve using
+> `rotor_speed_min/max` and new param `motor_curve_k` (default 1.0 = linear speed map). Verified
+> by `scratchpad/tests/test_throttle_curve.py`: endpoints, monotonicity, k=1 linear / k=0 sqrt,
+> exact match to the SkyDreamer reference at k=0.5 (w_min=341.75, w_max=3100), out-of-range
+> clipping, and integration to the commanded steady-state speed.
+> - **Deferred:** command noise ε_u (from C1) is the natural companion here (perturb `u` pre-curve);
+>   not yet added.
+
 ### A4. Asymmetric rotor spin-up/spin-down dynamics ✅(source-verified)
 **Source:** Crazyflow `first_principles/dynamics.py:115–119` + params.toml.
 ```
@@ -229,6 +289,15 @@ coefs `[7.356, 0, 0, 2.444e-4]`): near hover (~10 kRPM) the quadratic term contr
 `k₂·(Ω_c+Ω) ≈ 4.9 s⁻¹`, total effective rate ≈ 12 s⁻¹ → τ ≈ 0.08 s, agreeing with RotorPy's
 identified crazyflie `τ_m = 0.072 s` ✓. cf21B_500 spin-up ≈ 2.4× faster than spin-down.
 **RotorPy site:** :281 (+batched :902); 4 optional coefficients, `τ_m` fallback.
+
+> **STATUS (implemented 2026-07-07):** `Multirotor._rotor_accel(cmd, Omega)` implements the
+> asymmetric model, routed from `_s_dot_fn`. New optional param `rotor_dyn_coef = [ka1,ka2,kd1,kd2]`
+> (rad/s units); absent → first-order `1/tau_m` (exact recovery via `[1/τ,0,1/τ,0]`). Verified by
+> `scratchpad/tests/test_motor_dynamics.py`: regression, first-order reduction, up/down asymmetry,
+> exact Crazyflow `where()` formula match, and integration (cf21B_500: step-up settles 0.158 s vs
+> step-down 0.328 s). **Porting note:** Crazyflow coefficients are in RPM units — convert the
+> quadratic coefs by (60/2π)² and linear by (60/2π) to rad/s.
+> - **Deferred (batched):** batched motor model still first-order (`τ_m`); default-equivalent.
 
 ### A5. Rotor inertia: reaction torque + gyroscopic precession ✅(derivation) / ⚠(Crazyflow sign)
 **Sources:** Crazyflow `first_principles/dynamics.py:142–149` (identified `prop_inertia`);
@@ -252,12 +321,31 @@ counter-rotating pairs; ≈5–10% of available roll/pitch moment during hard ya
 **RotorPy site:** new `I_rotor` param; two terms in `compute_body_wrench` (`Ω̇` available from the
 motor model).
 
+> **STATUS (implemented 2026-07-07):** `Multirotor.rotor_inertia_moment(body_rates, rotor_speeds,
+> rotor_accel)` adds gyroscopic precession + reaction torque, called from `_s_dot_fn` (where Ω̇ is
+> already computed). New param `rotor_inertia` (kg·m², default 0 → term off). Uses physical spin
+> `spin = −rotor_dir` per F-6. Verified by `scratchpad/tests/test_rotor_inertia.py`: gyro term
+> equals an independent `−ω×h` to 0.0; reaction `−I_r Σ spinΩ̇` exact; balanced-quad invariance;
+> regression-zero at default. **F-3 confirmed numerically**: our gyro y-component is opposite in
+> sign to Crazyflow's — flag in upstream PR + report to Crazyflow.
+> - **Deferred (batched):** term not added to `BatchedMultirotor` yet (no param file sets
+>   rotor_inertia, so batched≡NumPy at default; batched_sims equivalence test still passes).
+
 ### A6. Motor command latency ✅(paper)
 **Source:** SkyDreamer paper (11 ms action delay in training; not in their repo).
 ```
 u_applied(t) = u_cmd(t − t_d)        (ring buffer of round(t_d/dt) steps, default t_d = 0)
 ```
 **RotorPy site:** `step()` before the motor model, both paths.
+
+> **STATUS (implemented 2026-07-07):** `Multirotor._apply_command_delay(control, t_step)` delays
+> the whole control dict by `round(motor_delay_time/t_step)` steps via a `deque(maxlen=n+1)`,
+> called at the top of `step()`. New param `motor_delay_time` (s, default 0 → no delay, buffer
+> never created). Verified by `scratchpad/tests/test_command_delay.py`: delay-line returns
+> `cmd[k−n]` exactly, constant-command invariance, step-change held for n steps then responds,
+> regression at delay 0. **Caveat:** applied in `step()` only; `statedot()` (IMU diagnostic) uses
+> the undelayed command, so IMU accel is slightly inconsistent under nonzero delay — a wiring
+> detail for the firmware port, noted here.
 
 ### A7. PWM quantization + supply-voltage layer ✅(source-verified)
 **Source:** Crazyflow params.toml (`pwm_min=7000, pwm_max=65535`, `vmotor2*` polynomials),
@@ -273,6 +361,16 @@ Identified: cf2x_L250 `vmotor2thrust = [−0.01483, 0.04724, −0.01847, 0.00596
 SkyDreamer measured Ω_max 3200→2200 rad/s (−30%) over one battery.
 **RotorPy site:** optional battery state modulating Ω_max / thrust curve; quantization in the
 command path.
+
+> **STATUS (implemented 2026-07-07):** (a) **PWM quantization** in `cmd_motor_throttle`: when
+> `pwm_max > pwm_min`, throttle `u` snaps to the integer grid `round(u·(pwm_max−pwm_min))/…`
+> (params `pwm_min`, `pwm_max`, default 0/off). (b) **Battery sag hook**: vehicle attribute
+> `rotor_speed_max_scale` (default 1.0) scales the achievable max in `step()`'s clips.
+> (c) **Battery models** in `rotorpy/battery.py`: `NoBatterySag`, `LinearBatterySag(drop_frac,
+> duration)`, `VoltageBatterySag(vmotor2rpm, V0, discharge_rate)` (Crazyflow voltage→RPM). Verified
+> by `scratchpad/tests/test_pwm_battery.py`: regression, grid snapping, speed cap under sag,
+> model trajectories. **Deferred:** voltage→thrust-curve modulation and `simulate()` wiring of a
+> `battery_profile` (mirrors the `disturbance_profile` pattern) — the hook + models are in place.
 
 ## B. Aerodynamics
 
@@ -290,6 +388,15 @@ Relation to P1.4: `k_z`/`k_h` are the small-airspeed linearizations of this mult
 correction; a vehicle should use either {k_angle,k_hor} or {k_h}, not both, to avoid
 double-counting the in-plane effect. Gate behind `k_angle = k_hor = 0` defaults.
 **RotorPy site:** `compute_body_wrench`; needs `r_prop` param.
+
+> **STATUS (implemented 2026-07-07):** In `compute_body_wrench` (aero block): base rotor thrust
+> multiplied by `(1 + k_angle·α + k_hor·μ)` with `α = atan2(v_a,z, r_prop·ω̄)`,
+> `μ = atan2(‖v_a,xy‖, r_prop·ω̄)`; collective `−k_v2·v_a,z·|v_a,z|` added at CoM. New params
+> `k_angle`, `k_hor`, `k_v2`, `r_prop` (falls back to `rotor_radius`), all default 0/inert.
+> Applied before translational lift so it scales only the base thrust. Verified by
+> `scratchpad/tests/test_aoa_thrust.py`: regression, zero-airspeed invariance, hand-calc match,
+> and **exact** reproduction of SkyDreamer's `k_w·(1+k_angle·α+k_hor·μ)·ΣΩ²` (err 0). Remember
+> F-4: SkyDreamer k_w is mass-normalized (`k_eta = m·k_w` when porting).
 
 ## C. Stochastic disturbance models
 
@@ -313,9 +420,23 @@ Piecewise-constant, resampled per channel:
 **RotorPy site:** a `wrench_profile` channel parallel to `wind_profile` (keeps `Multirotor`
 deterministic). Default off.
 
+> **STATUS (implemented 2026-07-07):** Wrench disturbance (ε_a, ε_M low+high bands) implemented.
+> - `rotorpy/disturbances/` package: `disturbance_template.py`, `default_disturbances.py`
+>   (`NoDisturbance`, `WrenchDisturbance`). Generator is specified in Table III acceleration
+>   units and converts via mass/inertia (`force = m·ε_a` world frame; `torque = I·(ε_M,lf+ε_M,hf)`
+>   body frame), resample-and-hold per band, seeded RNG.
+> - `Multirotor`/`BatchedMultirotor`: `external_force` (world N) + `external_torque` (body N·m)
+>   attributes, added in `_s_dot_fn`; zero by default. Wired through `simulate()` and
+>   `Environment` (optional `disturbance_profile`, defaults to `NoDisturbance`).
+> - **Deferred:** command noise ε_u lives in normalized command space [0,1]; it is a natural
+>   companion to the A3 throttle-curve abstraction and will be added there, not as a wrench.
+> - Verified by `scratchpad/tests/test_wrench_disturbance.py`: regression-zero hover, exact
+>   `F/m` and `I⁻¹M` injection, generator range bounds, resample-and-hold timing, seed
+>   determinism; plus an integration check (0.02 N up → `vz = F/m·t`).
+
 ### C2. Slow parameter drift (battery sag)
 Covered by A7; minimal variant `Ω_max(t) = Ω_max,0·(1 − c·t)`, c ≈ 30% per battery duration
-(SkyDreamer field data).
+(SkyDreamer field data). **Implemented — see A7 status (`rotorpy/battery.py`).**
 
 ## D. Domain-randomization ranges (data, not a feature)
 
@@ -328,6 +449,19 @@ Extend `learning_utils.py` defaults to all physical parameters, per-episode:
 | Eval (if distinguished) | ±20% |
 
 Keep the existing hover-feasibility bound on k_η (learning_utils.py:40–53).
+
+> **STATUS (implemented 2026-07-07):** `learning_utils.percent_randomization(nominal_params, pct=0.30,
+> motor_limit_pct=0.20)` builds a full ranges dict (±30% dynamics, ±20% motor limits), skipping
+> zero/absent params. `update_vehicle_params` extended to apply drag (`c_Dx/c_Dy/c_Dz/k_d/k_z` via
+> `update_drag`) and `rotor_speed_min/max`, sampling the speed limits first so the hover-feasibility
+> clamp uses the randomized max. **Robustness fix:** the k_eta feasibility clamp now raises the band
+> *upper* bound too when `min_k_eta` exceeds it (previously the uniform range could invert and yield
+> infeasible k_eta once rotor_speed_max is randomized low). Verified by
+> `scratchpad/tests/test_domain_randomization.py`: band construction, in-bounds sampling, **every
+> sampled drone hovers** (min thrust/weight margin 1.44), default dict unchanged.
+> - **Deferred (batched):** ranges cover only params with batched `update_*` setters; per-rotor
+>   arrays, r_prop, rotor_inertia, curve k, A4 coefs need batched param plumbing first (NumPy is
+>   canonical).
 
 ## E. Out of scope for RotorPy (tracked so nothing is lost)
 
@@ -350,6 +484,17 @@ term computes `ω̇×p_BS,W` and `ω×(ω×p_BS,W)` using **body-frame** `ω`, `
 **F-2 ⚠ RotorPy IMU gyro ignores mounting rotation** (`sensors/imu.py:117`): accelerometer
 applies `R_BSᵀ` but the gyroscope returns body-frame `ω` directly; should be `R_BSᵀ·ω_B`.
 No effect when `R_BS = I` (default).
+
+**F-2b ⚠ Batched IMU accel rotation was element-wise, not matmul** (`sensors/imu.py`
+BatchedImu): `R_SW` was built with `einsum('ij,bij->bij', R_BS.T, R_BW)`, a Hadamard product,
+not the matrix product `R_BS.T @ R_BW`. Wrong for any non-level attitude even with `R_BS = I`;
+the `__main__` demo only exercised the level case so it went unnoticed. Discovered while
+porting the F-1/F-2 fixes to the batched path.
+
+> **STATUS (implemented 2026-07-07):** F-1, F-2, F-2b fixed in `rotorpy/sensors/imu.py` (both
+> `Imu` and `BatchedImu`). Verified by `scratchpad/tests/test_imu_fixes.py`: NumPy and batched
+> paths now match an independent closed-form IMU model to < 4e-15 across rotated / offset /
+> mounted cases, and the default config (p_BS=0, R_BS=I) reduces exactly to `Rᵀ(v̇ − g)`, `ω`.
 
 **F-3 ⚠ Crazyflow gyroscopic precession sign** (their `abd/accessor.py` torque_inertia /
 `first_principles/dynamics.py:142–149`): x,y components implemented with the same sign

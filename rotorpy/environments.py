@@ -28,7 +28,8 @@ class Environment():
                        world        = None,     # The world object
                        estimator    = None,     # estimator object
                        sim_rate     = 100,      # The update frequency of the simulator in Hz
-                       safety_margin = 0.25,    # The radius of the safety region around the robot. 
+                       safety_margin = 0.25,    # The radius of the safety region around the robot.
+                       disturbance_profile = None,  # external-wrench disturbance profile; if none, no disturbance.
                        ):
 
         self.sim_rate = sim_rate
@@ -80,13 +81,20 @@ class Environment():
             self.mocap = mocap
 
         if estimator is None:
-            # In the likely case where an estimator is not supplied, default to the null state estimator. 
+            # In the likely case where an estimator is not supplied, default to the null state estimator.
             from rotorpy.estimators.nullestimator import NullEstimator
             self.estimator = NullEstimator()
         else:
             self.estimator = estimator
 
-        return 
+        if disturbance_profile is None:
+            # If no disturbance is specified, default to no external disturbance wrench.
+            from rotorpy.disturbances.default_disturbances import NoDisturbance
+            self.disturbance_profile = NoDisturbance()
+        else:
+            self.disturbance_profile = disturbance_profile
+
+        return
 
     def run(self,   t_final      = 10,       # The maximum duration of the environment in seconds
                     use_mocap    = False,    # boolean determines if the controller should use
@@ -126,6 +134,7 @@ class Environment():
                                                                                                                     self.safety_margin,
                                                                                                                     self.use_mocap,
                                                                                                                     terminate=self.terminate,
+                                                                                                                    disturbance_profile=self.disturbance_profile,
                                                                                                                     )
         if verbose:
             # Print relevant statistics or simulator status indicators here
