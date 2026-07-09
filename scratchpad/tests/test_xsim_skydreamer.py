@@ -25,9 +25,15 @@ os.environ.setdefault("NUMBA_DISABLE_JIT", "1")  # run their exact code as pure 
 import sys
 import numpy as np
 
-SKY = "/tmp/claude-1000/-home-james-code-RotorPy/946a5ea1-e934-4627-a38d-1b10cfb77116/scratchpad/skydreamer/embodied/envs/skydreamer.py"
-if not os.path.isfile(SKY):
-    print(f"SKIP: skydreamer.py not found at {SKY}")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SKY_CANDIDATES = [
+    os.path.join(_HERE, "..", "refs", "skydreamer", "embodied", "envs", "skydreamer.py"),
+    "/tmp/claude-1000/-home-james-code-RotorPy/946a5ea1-e934-4627-a38d-1b10cfb77116/scratchpad/skydreamer/embodied/envs/skydreamer.py",
+]
+SKY = next((os.path.abspath(c) for c in _SKY_CANDIDATES if os.path.isfile(c)), None)
+if SKY is None:
+    print("SKIP: skydreamer.py not found (expected scratchpad/refs/skydreamer). "
+          "Clone with: git clone --depth 1 https://github.com/The-Real-Thisas/dreamerv3 scratchpad/refs/skydreamer")
     sys.exit(0)
 
 _src = open(SKY).read()

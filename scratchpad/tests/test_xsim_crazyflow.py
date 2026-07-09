@@ -24,9 +24,16 @@ import types
 import numpy as np
 
 # --- import Crazyflow's real dynamics() without running its package __init__ (which needs mjx) ---
-CF = "/tmp/claude-1000/-home-james-code-RotorPy/946a5ea1-e934-4627-a38d-1b10cfb77116/scratchpad/crazyflow"
-if not os.path.isdir(CF):
-    print(f"SKIP: crazyflow clone not found at {CF}")
+# Look for the clone in the stable repo-local location first, then the old session /tmp path.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_CANDIDATES = [
+    os.path.join(_HERE, "..", "refs", "crazyflow"),
+    "/tmp/claude-1000/-home-james-code-RotorPy/946a5ea1-e934-4627-a38d-1b10cfb77116/scratchpad/crazyflow",
+]
+CF = next((os.path.abspath(c) for c in _CANDIDATES if os.path.isdir(c)), None)
+if CF is None:
+    print("SKIP: crazyflow clone not found (expected scratchpad/refs/crazyflow). "
+          "Clone with: git clone --depth 1 https://github.com/learnsyslab/crazyflow scratchpad/refs/crazyflow")
     sys.exit(0)
 sys.path.insert(0, CF)
 _pkg = types.ModuleType("crazyflow")

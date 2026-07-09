@@ -131,7 +131,7 @@ dmypy.json
 
 sandbox.py
 waypoint_traj.py
-# /scratchpad
+/scratchpad
 
 # Ignore csv files. 
 *.csv

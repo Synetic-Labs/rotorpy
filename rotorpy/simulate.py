@@ -170,7 +170,12 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
             control.append(control[-1])
         # IMU sampled at its own rate; the previous measurement is held between samples.
         if loop_idx % imu_decimation == 0:
-            state_dot = vehicle.statedot(state[-1], control[-1], t_step)
+            # Prefer the derivative cached by vehicle.step() (computed with the command actually
+            # applied this step, including any transport delay); fall back to a fresh statedot()
+            # for vehicles that don't cache it.
+            state_dot = getattr(vehicle, '_last_state_dot', None)
+            if state_dot is None:
+                state_dot = vehicle.statedot(state[-1], control[-1], t_step)
             imu_measurements.append(imu.measurement(state[-1], state_dot, with_noise=True))
             imu_gt.append(imu.measurement(state[-1], state_dot, with_noise=False))
         else:

@@ -266,6 +266,11 @@ class Multirotor(object):
         # by default.
         self.motor_cmd_noise = np.zeros(self.num_rotors)
 
+        # Cache of the state derivative {vdot, wdot} at the most recent post-step state, computed
+        # with the command actually applied that step. Read by the IMU (via simulate) so its
+        # acceleration is consistent with the step taken; see step().
+        self._last_state_dot = None
+
         # Integrator settings.
         if integrator_kwargs is None:
             self.integrator_kwargs = {'method':'RK45'}
@@ -294,20 +299,24 @@ class Multirotor(object):
 
         cmd_rotor_speeds = self.get_cmd_motor_speeds(state, control)
 
-        # The true motor speeds can not fall below min and max speeds.
-        cmd_rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, self.rotor_speed_max) 
+        # The true motor speeds can not fall below min or above the battery-scaled max (consistent
+        # with step()). NOTE: statedot() does not apply the command-transport delay (that has a
+        # buffer side-effect owned by step()); for delayed configs prefer the derivative cached by
+        # step() (self._last_state_dot), which reflects the command actually applied.
+        effective_max = self.rotor_speed_max * self.rotor_speed_max_scale
+        cmd_rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, effective_max)
 
         # Form autonomous ODE for constant inputs and integrate one time step.
         def s_dot_fn(t, s):
             return self._s_dot_fn(t, s, cmd_rotor_speeds)
         s = Multirotor._pack_state(state)
-        
+
         s_dot = s_dot_fn(0, s)
         v_dot = s_dot[3:6]
         w_dot = s_dot[10:13]
 
         state_dot = {'vdot': v_dot,'wdot': w_dot}
-        return state_dot 
+        return state_dot
 
 
     def _apply_command_delay(self, control, t_step):
@@ -367,6 +376,13 @@ class Multirotor(object):
         # Add noise to the motor speed measurement
         state['rotor_speeds'] += np.random.normal(scale=np.abs(self.motor_noise), size=(self.num_rotors,))
         state['rotor_speeds'] = np.clip(state['rotor_speeds'], self.rotor_speed_min, effective_max)
+
+        # Cache the instantaneous derivative at the final state under the command actually applied
+        # this step (already delayed and battery-clipped above). The IMU reads this (see simulate)
+        # so its acceleration is consistent with the step taken, rather than a separate statedot()
+        # re-evaluation that would use the undelayed command. One extra (cheap) dynamics eval.
+        s_dot_final = self._s_dot_fn(0.0, Multirotor._pack_state(state), cmd_rotor_speeds)
+        self._last_state_dot = {'vdot': s_dot_final[3:6].copy(), 'wdot': s_dot_final[10:13].copy()}
 
         return state
 

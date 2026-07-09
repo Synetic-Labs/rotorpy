@@ -614,6 +614,23 @@ float32 *before* upcasting (e.g. `1/0.072 → 13.88888931`). Both fixed during b
 > floor still present elsewhere in the pre-existing batched path, e.g. `tau_m`/`k_flap` tensors;
 > not chased). Verified by `scratchpad/tests/test_batched_parity.py`.
 
+**F-9 ⚠ IMU derivative was a separate, delay-inconsistent re-evaluation** (`simulate.py` +
+`Multirotor`): the IMU was fed `vehicle.statedot(new_state, control)`, a second dynamics eval that
+(a) could not apply the command transport delay (A6, buffer side-effect) so it used the *undelayed*
+command, (b) clipped to `rotor_speed_max` not the battery-scaled `effective_max`, and (c) for
+feedback abstractions recomputed the command from the *new* state. When `rotor_inertia ≠ 0` the
+reaction torque couples command→`ω̇`, so the IMU's acceleration could disagree with the step taken.
+> **STATUS (fixed 2026-07-08):** `Multirotor.step()` now caches `{vdot, wdot}` at the final state
+> under the command it actually applied (`self._last_state_dot`); `simulate.py` reads that in the
+> loop (falling back to `statedot()` for vehicles without the cache). `statedot()` also now uses
+> `effective_max` for consistency. For default vehicles (`rotor_inertia = 0`) `v̇`/`ω̇` are
+> command-independent, so this is a **zero-change** refactor (verified cache == statedot to 0.0);
+> it only tightens the `rotor_inertia≠0` + latency/sag cases. Verified by
+> `scratchpad/tests/test_imu_statedot_consistency.py`.
+>
+> Note: cross-sim reference repos are now cloned to the stable `scratchpad/refs/` (were in ephemeral
+> `/tmp`); the two `test_xsim_*.py` look there first and print a clone command if missing.
+
 ## Test protocol (run everything in RotorPy before any port)
 
 1. **Regression-zero**: every addition defaults off/neutral; with defaults, trajectories match
