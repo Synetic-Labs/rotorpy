@@ -162,6 +162,15 @@ class Multirotor(object):
         self.k_v2            = quad_params.get('k_v2', 0.0)      # collective vertical drag-like coeff, N/(m/s)^2
         self.r_prop          = quad_params.get('r_prop', quad_params.get('rotor_radius', 0.0))  # propeller radius, m
 
+        # Per-rotor thrust axis (unit vectors in the body frame), shape (num_rotors, 3). Default is
+        # +body-z for every rotor (the ideal, perfectly-aligned case). Small tilts model real
+        # assembly/manufacturing misalignment (thrust vector not exactly body-z), which produces
+        # parasitic body forces and moments and is a useful sim-to-real / domain-randomization axis.
+        _thrust_dir = np.asarray(quad_params.get('thrust_dir',
+                                 np.tile(np.array([0.0, 0.0, 1.0]), (self.num_rotors, 1))), dtype=float)
+        _thrust_dir = _thrust_dir.reshape(self.num_rotors, 3)
+        self.thrust_dir = _thrust_dir / np.linalg.norm(_thrust_dir, axis=1, keepdims=True)  # normalize each axis
+
         # Translational lift (k_h) and the advance-ratio thrust correction (k_hor) both model the
         # increase in thrust with in-plane airspeed; the angle-of-attack term (k_angle) is the
         # vertical companion of that same SkyDreamer thrust-correction model. Enabling k_h together
@@ -252,6 +261,10 @@ class Multirotor(object):
         # for a given step.
         self.external_force = np.zeros(3)
         self.external_torque = np.zeros(3)
+        # Additive noise on the normalized actuator command u in [0,1] (SkyDreamer eps_u), set
+        # externally each step by a disturbance profile. Only used by 'cmd_motor_throttle'. Zero
+        # by default.
+        self.motor_cmd_noise = np.zeros(self.num_rotors)
 
         # Integrator settings.
         if integrator_kwargs is None:
@@ -435,11 +448,10 @@ class Multirotor(object):
         # Get the local airspeeds for each rotor
         local_airspeeds = body_airspeed_vector[:, np.newaxis] + Multirotor.hat_map(body_rates)@(self.rotor_geometry.T)
 
-        # Compute the thrust of each rotor, assuming that the rotors all point in the body z direction!
-        # Polynomial curve thrust_c0 + thrust_c1*Omega + k_eta*Omega^2 (reduces to k_eta*Omega^2 by default).
-        # Coefficients are per-rotor (shape (num_rotors,)); build the (3, num_rotors) thrust array explicitly.
-        T = np.zeros((3, self.num_rotors))
-        T[2, :] = self.thrust_c0 + self.thrust_c1 * rotor_speeds + self.k_eta * rotor_speeds**2
+        # Thrust MAGNITUDE of each rotor: polynomial thrust_c0 + thrust_c1*Omega + k_eta*Omega^2
+        # (reduces to k_eta*Omega^2 by default). Per-rotor (shape (num_rotors,)). The direction is
+        # applied after the aero corrections via self.thrust_dir (default +body-z).
+        T_mag = self.thrust_c0 + self.thrust_c1 * rotor_speeds + self.k_eta * rotor_speeds**2
 
         # Add in aero wrenches (if applicable)
         if self.aero:
@@ -460,26 +472,30 @@ class Multirotor(object):
                 denom = self.r_prop * w_bar
                 alpha = np.arctan2(body_airspeed_vector[2], denom)
                 mu = np.arctan2(np.hypot(body_airspeed_vector[0], body_airspeed_vector[1]), denom)
-                T[2, :] = T[2, :] * (1.0 + self.k_angle*alpha + self.k_hor*mu)
+                T_mag = T_mag * (1.0 + self.k_angle*alpha + self.k_hor*mu)
             # Collective vertical airspeed-squared term (acts at the CoM along body z).
             if self.k_v2 != 0.0:
                 vaz = body_airspeed_vector[2]
                 D = D + np.array([0.0, 0.0, -self.k_v2 * vaz * abs(vaz)])
 
-            # Translational lift.
-            T += np.array([0, 0, self.k_h])[:, np.newaxis]*(local_airspeeds[0, :]**2 + local_airspeeds[1, :]**2)
+            # Translational lift (adds to thrust magnitude along the rotor axis).
+            T_mag = T_mag + self.k_h*(local_airspeeds[0, :]**2 + local_airspeeds[1, :]**2)
 
         else:
             D = np.zeros(3,)
             H = np.zeros((3,self.num_rotors))
             M_flap = np.zeros((3,self.num_rotors))
 
+        # Project thrust magnitudes onto each rotor's thrust axis (default +body-z). With a tilted
+        # axis this yields parasitic x/y thrust components and the associated moments.
+        T = self.thrust_dir.T * T_mag                                  # (3, num_rotors)
+
         # Compute the moments due to the rotor thrusts, rotor drag (if applicable), and rotor drag torques
         M_force = -np.einsum('ijk, ik->j', Multirotor.hat_map(self.rotor_geometry), T+H)
-        # Yaw moment per rotor: dir_i * (torque_c0 + torque_c1*Omega_i + k_m_i*Omega_i^2).
-        # Reduces to dir_i * k_m_i * Omega_i^2 by default. Coefficients are per-rotor.
-        M_yaw = np.zeros((3, self.num_rotors))
-        M_yaw[2, :] = self.rotor_dir * (self.torque_c0 + self.torque_c1 * rotor_speeds + self.k_m * rotor_speeds**2)
+        # Yaw/reaction moment magnitude per rotor: dir_i * (torque_c0 + torque_c1*Omega_i + k_m_i*Omega_i^2),
+        # directed along the rotor spin axis (thrust_dir). Reduces to dir_i * k_m_i * Omega_i^2 * z by default.
+        M_yaw_mag = self.rotor_dir * (self.torque_c0 + self.torque_c1 * rotor_speeds + self.k_m * rotor_speeds**2)
+        M_yaw = self.thrust_dir.T * M_yaw_mag                          # (3, num_rotors)
 
         # Sum all elements to compute the total body wrench
         FtotB = np.sum(T + H, axis=1) + D
@@ -567,7 +583,9 @@ class Multirotor(object):
             # The controller commands normalized per-motor throttle u in [0, 1]. This is the
             # command path of a real ESC+battery: throttle maps nonlinearly to steady-state speed
             # (SkyDreamer). w_c = (w_max - w_min)*sqrt(k*u^2 + (1-k)*u) + w_min.
-            u = np.clip(np.asarray(control['cmd_motor_throttle'], dtype=float), 0.0, 1.0)
+            # Add actuator command noise (eps_u, zero by default) before clipping to [0,1].
+            u = np.asarray(control['cmd_motor_throttle'], dtype=float) + self.motor_cmd_noise
+            u = np.clip(u, 0.0, 1.0)
             # Optional PWM quantization: snap u to the integer PWM grid (real ESCs are quantized).
             if self.pwm_max > self.pwm_min:
                 levels = self.pwm_max - self.pwm_min

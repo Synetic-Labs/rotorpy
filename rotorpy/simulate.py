@@ -28,7 +28,7 @@ class ExitStatus(Enum):
     FLY_AWAY     = 'Failure: Your quadrotor is out of control; it flew away with a position error greater than 20 meters.'
     COLLISION    = 'Failure: Your quadrotor collided with an object.'
 
-def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, disturbance_profile=None, control_rate=None):
+def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, disturbance_profile=None, control_rate=None, imu_rate=None, mocap_rate=None):
     """
     Perform a vehicle simulation and return the numerical results.
 
@@ -128,6 +128,11 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
         control_decimation = 1
     else:
         control_decimation = max(1, int(round((1.0 / t_step) / control_rate)))
+    # Sensor sample-rate decoupling: the IMU and motion-capture sensors sample at their own rate
+    # (typically slower than physics); between samples the previous measurement is held, modeling a
+    # real sensor's zero-order-held output. Default (None) => sample every physics step.
+    imu_decimation = 1 if imu_rate is None else max(1, int(round((1.0 / t_step) / imu_rate)))
+    mocap_decimation = 1 if mocap_rate is None else max(1, int(round((1.0 / t_step) / mocap_rate)))
     loop_idx = 0
 
     while True:
@@ -144,9 +149,15 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
         disturbance = disturbance_profile.update(time[-1], state[-1])
         vehicle.external_force = disturbance['force']
         vehicle.external_torque = disturbance['torque']
+        if 'motor_cmd_noise' in disturbance:
+            vehicle.motor_cmd_noise = disturbance['motor_cmd_noise']
         state.append(vehicle.step(state[-1], control[-1], t_step))
         flat.append(trajectory.update(time[-1]))
-        mocap_measurements.append(mocap.measurement(state[-1], with_noise=True, with_artifacts=mocap.with_artifacts))
+        # Mocap sampled at its own rate; the previous measurement is held between samples.
+        if loop_idx % mocap_decimation == 0:
+            mocap_measurements.append(mocap.measurement(state[-1], with_noise=True, with_artifacts=mocap.with_artifacts))
+        else:
+            mocap_measurements.append(mocap_measurements[-1])
         state_estimate.append(estimator.step(state[-1], control[-1], imu_measurements[-1], mocap_measurements[-1]))
         if loop_idx % control_decimation == 0:
             # Controller update boundary: recompute the command.
@@ -157,9 +168,14 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
         else:
             # Hold the previous command (zero-order hold) between control updates.
             control.append(control[-1])
-        state_dot = vehicle.statedot(state[-1], control[-1], t_step)
-        imu_measurements.append(imu.measurement(state[-1], state_dot, with_noise=True))
-        imu_gt.append(imu.measurement(state[-1], state_dot, with_noise=False))
+        # IMU sampled at its own rate; the previous measurement is held between samples.
+        if loop_idx % imu_decimation == 0:
+            state_dot = vehicle.statedot(state[-1], control[-1], t_step)
+            imu_measurements.append(imu.measurement(state[-1], state_dot, with_noise=True))
+            imu_gt.append(imu.measurement(state[-1], state_dot, with_noise=False))
+        else:
+            imu_measurements.append(imu_measurements[-1])
+            imu_gt.append(imu_gt[-1])
 
         wall_dt = max(perf_counter() - step_start_time, 1e-6)
         fps = 1/wall_dt

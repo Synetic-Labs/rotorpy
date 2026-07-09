@@ -14,6 +14,7 @@ comparable to the paper.
     linear accel   eps_a          1 Hz     +/- 3   m/s^2       +/- 2   m/s^2
     angular accel  eps_M (low)    1 Hz     +/- 3   rad/s^2     +/- 2   rad/s^2
     angular accel  eps_M (high)   90 Hz    +/- 125 rad/s^2     +/- 100 rad/s^2
+    motor command  eps_u          90 Hz    +/- 0.2             --
 
 See rotorpy/disturbances/disturbance_template.py for the interface contract.
 """
@@ -25,12 +26,14 @@ from rotorpy.disturbances.disturbance_template import DisturbanceTemplate
 class NoDisturbance(DisturbanceTemplate):
     """Trivial disturbance: zero external wrench for all time (default)."""
 
-    def __init__(self):
+    def __init__(self, num_rotors=4):
         self._zero_force = np.zeros(3)
         self._zero_torque = np.zeros(3)
+        self._zero_cmd = np.zeros(num_rotors)
 
     def update(self, t, state):
-        return {'force': self._zero_force, 'torque': self._zero_torque}
+        return {'force': self._zero_force, 'torque': self._zero_torque,
+                'motor_cmd_noise': self._zero_cmd}
 
 
 class WrenchDisturbance(DisturbanceTemplate):
@@ -68,18 +71,22 @@ class WrenchDisturbance(DisturbanceTemplate):
                  accel_range=3.0, accel_rate=1.0,
                  angaccel_lf_range=3.0, angaccel_lf_rate=1.0,
                  angaccel_hf_range=125.0, angaccel_hf_rate=90.0,
+                 cmd_noise_range=0.2, cmd_noise_rate=90.0, num_rotors=4,
                  seed=None):
         self.mass = float(mass)
         self.inertia = np.asarray(inertia, dtype=float)
+        self.num_rotors = int(num_rotors)
 
         self.accel_range = float(accel_range)
         self.angaccel_lf_range = float(angaccel_lf_range)
         self.angaccel_hf_range = float(angaccel_hf_range)
+        self.cmd_noise_range = float(cmd_noise_range)
 
         # Hold intervals (seconds) per band.
         self.accel_period = 1.0 / accel_rate
         self.angaccel_lf_period = 1.0 / angaccel_lf_rate
         self.angaccel_hf_period = 1.0 / angaccel_hf_rate
+        self.cmd_noise_period = 1.0 / cmd_noise_rate
 
         self.rng = np.random.default_rng(seed)
 
@@ -87,14 +94,16 @@ class WrenchDisturbance(DisturbanceTemplate):
         self._accel = self._draw(self.accel_range)
         self._angaccel_lf = self._draw(self.angaccel_lf_range)
         self._angaccel_hf = self._draw(self.angaccel_hf_range)
+        self._cmd_noise = self._draw(self.cmd_noise_range, self.num_rotors)
         # Initialise last-sample times so the first update() past t=0 does not immediately
         # resample; bands resample once t advances past their period.
         self._t_accel = 0.0
         self._t_angaccel_lf = 0.0
         self._t_angaccel_hf = 0.0
+        self._t_cmd_noise = 0.0
 
-    def _draw(self, half_width):
-        return self.rng.uniform(-half_width, half_width, size=3)
+    def _draw(self, half_width, size=3):
+        return self.rng.uniform(-half_width, half_width, size=size)
 
     def update(self, t, state):
         # Resample any band whose hold interval has elapsed. Using a while loop keeps the
@@ -109,7 +118,10 @@ class WrenchDisturbance(DisturbanceTemplate):
         if t - self._t_angaccel_hf >= self.angaccel_hf_period:
             self._angaccel_hf = self._draw(self.angaccel_hf_range)
             self._t_angaccel_hf = t
+        if t - self._t_cmd_noise >= self.cmd_noise_period:
+            self._cmd_noise = self._draw(self.cmd_noise_range, self.num_rotors)
+            self._t_cmd_noise = t
 
         force = self.mass * self._accel
         torque = self.inertia @ (self._angaccel_lf + self._angaccel_hf)
-        return {'force': force, 'torque': torque}
+        return {'force': force, 'torque': torque, 'motor_cmd_noise': self._cmd_noise}

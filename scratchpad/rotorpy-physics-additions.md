@@ -30,6 +30,9 @@ available) and the NumPy↔batched equivalence test still pass.
 | xsim | Cross-validation vs Crazyflow & SkyDreamer real code | (Part IV) | `test_xsim_crazyflow.py`, `test_xsim_skydreamer.py` |
 | batched | A2/A3/A4/A5/B1 parity + F-8 float32 fix | `vehicles/multirotor.py` | `test_batched_parity.py` |
 | E2 | Control-rate decoupling (harness, not physics) | `learning/quadrotor_environments.py`, `simulate.py`, `environments.py` | `test_control_rate.py` |
+| C1+ | ε_u actuator command noise (completes C1) | `disturbances/`, `vehicles/multirotor.py`, `simulate.py` | `test_wrench_disturbance.py` |
+| F1 | Thrust-axis misalignment (per-rotor thrust_dir) | `vehicles/multirotor.py` | `test_thrust_axis.py` |
+| E3 | Separate IMU/mocap/obs sample rates (harness) | `simulate.py`, `environments.py`, `learning/quadrotor_environments.py` | `test_control_rate.py` |
 
 **Cross-simulator validation done** (Part IV): every added component reproduces the reference
 sims' *real running code* (Crazyflow, SkyDreamer) exactly or to a documented epsilon; F-3 and F-4
@@ -448,11 +451,14 @@ deterministic). Default off.
 > - `Multirotor`/`BatchedMultirotor`: `external_force` (world N) + `external_torque` (body N·m)
 >   attributes, added in `_s_dot_fn`; zero by default. Wired through `simulate()` and
 >   `Environment` (optional `disturbance_profile`, defaults to `NoDisturbance`).
-> - **Deferred:** command noise ε_u lives in normalized command space [0,1]; it is a natural
->   companion to the A3 throttle-curve abstraction and will be added there, not as a wrench.
+> - **ε_u actuator command noise (added 2026-07-08):** `WrenchDisturbance` now also emits a
+>   `motor_cmd_noise` band (per-rotor, ±0.2 at 90 Hz, resample-and-hold). Applied via a
+>   `Multirotor.motor_cmd_noise` attribute (set by `simulate()` from the disturbance) to the
+>   `cmd_motor_throttle` command before clipping to [0,1] — the only normalized-command
+>   abstraction. C1 now fully reproduces SkyDreamer Table III.
 > - Verified by `scratchpad/tests/test_wrench_disturbance.py`: regression-zero hover, exact
 >   `F/m` and `I⁻¹M` injection, generator range bounds, resample-and-hold timing, seed
->   determinism; plus an integration check (0.02 N up → `vz = F/m·t`).
+>   determinism, integration check (0.02 N up → `vz = F/m·t`), and ε_u range/application/zero-noise.
 
 ### C2. Slow parameter drift (battery sag)
 Covered by A7; minimal variant `Ω_max(t) = Ω_max,0·(1 − c·t)`, c ≈ 30% per battery duration
@@ -482,6 +488,41 @@ Keep the existing hover-feasibility bound on k_η (learning_utils.py:40–53).
 > - **Deferred (batched):** ranges cover only params with batched `update_*` setters; per-rotor
 >   arrays, r_prop, rotor_inertia, curve k, A4 coefs need batched param plumbing first (NumPy is
 >   canonical).
+
+## F. Beyond the three sources — literature-grounded physics
+
+### F1. Thrust-axis misalignment (per-rotor thrust direction) ✅(implemented 2026-07-08)
+**Source:** standard rigid-body rotorcraft modeling (not SkyDreamer/Crazyflow/Genesis — those all
+assume thrust ∥ body-z). Real airframes have small thrust-vector tilt from assembly/motor-mount
+tolerances, producing parasitic in-plane forces and moments; a useful DR axis.
+**Math:** each rotor has a body-frame unit axis `e_i` (default `ẑ`). Thrust and reaction torque act
+along it:
+```
+T_i = ‖T_i‖ · e_i           (‖T_i‖ = poly magnitude incl. AoA/lift corrections)
+τ_yaw,i = dir_i·‖τ_i‖ · e_i
+M = Σ_i r_i × T_i + Σ_i τ_yaw,i
+```
+**RotorPy site:** new `thrust_dir` param (num_rotors×3, normalized, default `ẑ`). `compute_body_wrench`
+now carries thrust *magnitude* through the aero corrections, then projects onto `thrust_dir`.
+Default reproduces the aligned wrench exactly. Verified by `scratchpad/tests/test_thrust_axis.py`:
+regression (no x/y force at default), single-rotor tilt vs hand-computed `Σ r×T` + tilted yaw
+(`Fx = T·sinθ`), uniform-tilt net-thrust tilt, yaw z-scaling by `cosθ`. NumPy only (batched deferred,
+consistent with other forward-model ports).
+
+## E3. Separate observation / sensor sample rates (harness, approved 2026-07-08)
+
+Companion to E2 (control-rate). Sensors sample at their own rate, holding the previous measurement
+zero-order between samples — models real IMU/mocap/estimator latency independent of the physics and
+control rates.
+> **STATUS (implemented 2026-07-08):**
+> - `simulate.py` + `Environment`: `imu_rate`, `mocap_rate` (Hz). Each sensor's `measurement()` is
+>   recomputed only on its sample boundary (`round((1/t_step)/rate)`), else the previous reading is
+>   held. Default None => every physics step (unchanged).
+> - Gym env: `obs_rate` (Hz, ≤ control_rate). The observation *returned to the policy* is refreshed
+>   at `round(control_rate/obs_rate)` decisions and zero-order-held otherwise; **reward and
+>   termination still use the true post-step state**. Just-reset envs always get a fresh obs.
+> Verified by `scratchpad/tests/test_control_rate.py`: IMU held at ~1/5 rate, mocap at ~1/2,
+> gym obs held in blocks while the true state keeps advancing.
 
 ## E. Out of scope for RotorPy (tracked so nothing is lost)
 

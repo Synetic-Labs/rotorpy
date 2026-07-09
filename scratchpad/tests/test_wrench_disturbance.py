@@ -121,13 +121,56 @@ def test_generator():
 
     # NoDisturbance returns zero.
     nz = NoDisturbance().update(3.3, None)
-    oknz = np.allclose(nz['force'], 0) and np.allclose(nz['torque'], 0)
+    oknz = np.allclose(nz['force'], 0) and np.allclose(nz['torque'], 0) and np.allclose(nz['motor_cmd_noise'], 0)
     ok = ok and oknz
     print(f"  [{'OK ' if oknz else 'FAIL'}] NoDisturbance is zero")
     return ok
 
 
+def test_cmd_noise():
+    print("=== C1 actuator command noise (eps_u) ===")
+    m = Multirotor(quad_params, control_abstraction='cmd_motor_throttle', aero=False)
+    ok = True
+
+    # Generator: motor_cmd_noise in +/-0.2, per-rotor, resample-and-hold at 90 Hz.
+    d = WrenchDisturbance(m.mass, m.inertia, cmd_noise_range=0.2, cmd_noise_rate=90.0,
+                          num_rotors=m.num_rotors, seed=5)
+    w = d.update(0.0, None)
+    n0 = w['motor_cmd_noise']
+    okrange = n0.shape == (m.num_rotors,) and np.all(np.abs(n0) <= 0.2 + 1e-12)
+    ok = ok and okrange
+    print(f"  [{'OK ' if okrange else 'FAIL'}] noise shape {n0.shape}, within +/-0.2 (max {np.max(np.abs(n0)):.3f})")
+
+    # 90 Hz -> period 0.0111 s; held within a step at 100 Hz sometimes, varies across steps.
+    dt = 0.01
+    seq = [d.update(k * dt, None)['motor_cmd_noise'].copy() for k in range(20)]
+    varies = any(not np.allclose(seq[i], seq[i + 1]) for i in range(19))
+    ok = ok and varies
+    print(f"  [{'OK ' if varies else 'FAIL'}] command-noise band varies over steps")
+
+    # Vehicle application: throttle command shifted by the noise, then clipped, before the curve.
+    m.motor_cmd_noise = np.array([0.1, -0.1, 0.0, 0.05])
+    u = np.array([0.5, 0.5, 0.5, 0.5])
+    speeds = m.get_cmd_motor_speeds(None, {'cmd_motor_throttle': u})
+    # Expected: curve applied to clip(u + noise).
+    ueff = np.clip(u + m.motor_cmd_noise, 0, 1)
+    k = m.motor_curve_k
+    expect = (m.rotor_speed_max - m.rotor_speed_min) * np.sqrt(k * ueff**2 + (1 - k) * ueff) + m.rotor_speed_min
+    okapply = np.max(np.abs(speeds - expect)) < 1e-9
+    ok = ok and okapply
+    print(f"  [{'OK ' if okapply else 'FAIL'}] throttle shifted by eps_u before curve (err {np.max(np.abs(speeds-expect)):.1e})")
+
+    # Zero noise -> unchanged (regression).
+    m.motor_cmd_noise = np.zeros(m.num_rotors)
+    s0 = m.get_cmd_motor_speeds(None, {'cmd_motor_throttle': u})
+    base = (m.rotor_speed_max - m.rotor_speed_min) * np.sqrt(k * u**2 + (1 - k) * u) + m.rotor_speed_min
+    okzero = np.max(np.abs(s0 - base)) < 1e-12
+    ok = ok and okzero
+    print(f"  [{'OK ' if okzero else 'FAIL'}] zero eps_u leaves throttle unchanged")
+    return ok
+
+
 if __name__ == "__main__":
-    r = [test_regression_zero(), test_injection(), test_generator()]
+    r = [test_regression_zero(), test_injection(), test_generator(), test_cmd_noise()]
     print()
     print("ALL PASSED" if all(r) else "SOME FAILED")

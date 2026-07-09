@@ -82,6 +82,7 @@ class QuadrotorEnv(VecEnv):
                  world        = None,                   # The world object
                  sim_rate = 100,                        # The physics update frequency of the simulator in Hz
                  control_rate = None,                   # Policy decision rate in Hz (<= sim_rate). None => equals sim_rate (one physics step per action).
+                 obs_rate = None,                       # Observation refresh rate in Hz (<= control_rate). None => fresh obs every decision.
                  aero = True,                           # Whether or not aerodynamic wrenches are computed.
                  render_mode = "None",                  # The rendering mode
                  render_fps = 30,                       # The rendering frames per second. Lower this for faster visualization.
@@ -134,6 +135,19 @@ class QuadrotorEnv(VecEnv):
             raise ValueError(f"control_rate ({control_rate}) cannot exceed sim_rate ({sim_rate}).")
         self.control_rate = control_rate
         self.n_substep = max(1, int(round(sim_rate / control_rate)))
+
+        # Observation-rate decoupling: the observation returned to the policy is refreshed at
+        # obs_rate and zero-order-held between refreshes (models sensing/estimation latency). The
+        # reward and termination still use the true post-step state. Default (None) => obs_rate ==
+        # control_rate => a fresh observation every decision (original behavior).
+        if obs_rate is None:
+            obs_rate = control_rate
+        if obs_rate > control_rate:
+            raise ValueError(f"obs_rate ({obs_rate}) cannot exceed control_rate ({control_rate}).")
+        self.obs_rate = obs_rate
+        self.obs_decimation = max(1, int(round(control_rate / obs_rate)))
+        self._held_obs = None
+        self._obs_counter = 0
         self.reward_fn = reward_fn
         self.metadata["render_fps"] = render_fps
 
@@ -324,6 +338,9 @@ class QuadrotorEnv(VecEnv):
         # Now get observation and info using the new state
         observation = self._get_obs()
         self.reset_infos = {}
+        # Reset the zero-order-held observation buffer so the new episode starts from a fresh obs.
+        self._held_obs = observation.copy()
+        self._obs_counter = 0
 
         self.render()
 
@@ -403,7 +420,17 @@ class QuadrotorEnv(VecEnv):
 
         self.render()
 
-        observation = self._get_obs()
+        # Observation returned to the policy: refreshed at obs_rate, zero-order-held otherwise.
+        # Just-reset envs always get a fresh observation so the next episode starts cleanly.
+        self._obs_counter += 1
+        fresh_obs = self._get_obs()
+        if self._held_obs is None or self.obs_decimation == 1:
+            self._held_obs = fresh_obs
+        else:
+            if self._obs_counter % self.obs_decimation == 0:
+                self._held_obs = fresh_obs
+            self._held_obs = np.where(np.asarray(dones).reshape(-1, 1), fresh_obs, self._held_obs)
+        observation = self._held_obs.copy()
         for i in range(min(self.num_envs, 5)):
             self.debug_states[i,int(self.t[i]/self.t_step)] = self.vehicle_states['x'][i].cpu().numpy()
 

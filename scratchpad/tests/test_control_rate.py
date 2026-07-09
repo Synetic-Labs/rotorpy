@@ -129,7 +129,73 @@ def test_simulate_gate():
     return ok
 
 
+def test_simulate_sensor_rates():
+    print("=== separate IMU + mocap sample rates in simulate() (ZOH between samples) ===")
+    from rotorpy.simulate import simulate
+    from rotorpy.vehicles.multirotor import Multirotor
+    from rotorpy.sensors.imu import Imu
+    from rotorpy.sensors.external_mocap import MotionCapture
+    from rotorpy.estimators.nullestimator import NullEstimator
+    from rotorpy.world import World
+    from rotorpy.wind.default_winds import NoWind
+
+    class Ctrl:
+        def update(self, t, state, flat):
+            return {'cmd_motor_speeds': np.full(4, 2000.0)}
+    class Traj:
+        def update(self, t):
+            return {'x': np.zeros(3), 'x_dot': np.zeros(3), 'x_ddot': np.zeros(3), 'x_dddot': np.zeros(3),
+                    'x_ddddot': np.zeros(3), 'yaw': 0.0, 'yaw_dot': 0.0, 'yaw_ddot': 0.0}
+
+    veh = Multirotor(quad_params, control_abstraction='cmd_motor_speeds', aero=False)
+    init = {'x': np.zeros(3), 'v': np.zeros(3), 'q': np.array([0., 0., 0., 1.]), 'w': np.zeros(3),
+            'wind': np.zeros(3), 'rotor_speeds': np.full(4, 2000.0)}
+    world = World.empty((-10, 10, -10, 10, -10, 10))
+    # sim 100 Hz, IMU 20 Hz (decimation 5), mocap 50 Hz (decimation 2).
+    res = simulate(world, init, veh, Ctrl(), Traj(), NoWind(),
+                   Imu(sampling_rate=100), MotionCapture(sampling_rate=100), NullEstimator(),
+                   t_final=0.3, t_step=0.01, safety_margin=100, use_mocap=False,
+                   imu_rate=20, mocap_rate=50)
+    imu = res[4]['accel'][:, 0]      # accelerometer x over time
+    mocap = res[6]['x'][:, 0]        # mocap position x over time
+    n = len(imu)
+    imu_changes = int(np.sum(np.abs(np.diff(imu)) > 1e-12))
+    mocap_changes = int(np.sum(np.abs(np.diff(mocap)) > 1e-12))
+    # IMU should change ~1/5 as often, mocap ~1/2 as often, as the physics steps.
+    ok_imu = imu_changes < n / 3
+    ok_mocap = mocap_changes < n * 0.7
+    print(f"  [{'OK ' if ok_imu else 'FAIL'}] IMU held at ~1/5 rate ({imu_changes} changes / {n} steps)")
+    print(f"  [{'OK ' if ok_mocap else 'FAIL'}] mocap held at ~1/2 rate ({mocap_changes} changes / {n} steps)")
+    return ok_imu and ok_mocap
+
+
+def test_gym_obs_rate():
+    print("=== gym observation rate (returned obs zero-order-held; reward uses true state) ===")
+    env = QuadrotorEnv(num_envs=1, initial_states=_x0(), quad_params=quad_params,
+                       control_mode='cmd_motor_speeds', sim_rate=100, control_rate=100,
+                       obs_rate=25, aero=False, device=torch.device('cpu'), render_mode="None")
+    assert env.obs_decimation == 4, env.obs_decimation
+    env.reset(seed=0, options={"params": "fixed", "pos_bound": 0.0, "vel_bound": 0.0})
+    a = np.array([[0.5, 0.5, 0.5, 0.5]], dtype=np.float64)  # strong thrust -> state moves each step
+    returned = []
+    true_x = []
+    for _ in range(8):
+        obs, _, _, _ = env.step(a)
+        returned.append(obs[0].copy())
+        true_x.append(env.vehicle_states['x'][0, 2].item())   # true z climbs
+    returned = np.array(returned)
+    # Returned obs should be held in blocks of 4 (refresh at counter 4 and 8).
+    n_distinct = len({tuple(np.round(r, 9)) for r in returned})
+    ok_hold = n_distinct <= 3  # ~2 blocks over 8 steps
+    # True state advanced every step even though obs was held (staleness).
+    ok_true = (true_x[-1] - true_x[0]) > 1e-4 and np.allclose(returned[0], returned[1])
+    print(f"  [{'OK ' if ok_hold else 'FAIL'}] returned obs held in blocks ({n_distinct} distinct over 8 steps)")
+    print(f"  [{'OK ' if ok_true else 'FAIL'}] true state advances while obs held (dz={true_x[-1]-true_x[0]:.3f})")
+    return ok_hold and ok_true
+
+
 if __name__ == "__main__":
-    r = [test_regression(), test_substep_zoh(), test_guard(), test_simulate_gate()]
+    r = [test_regression(), test_substep_zoh(), test_guard(), test_simulate_gate(),
+         test_simulate_sensor_rates(), test_gym_obs_rate()]
     print()
     print("ALL PASSED" if all(r) else "SOME FAILED")

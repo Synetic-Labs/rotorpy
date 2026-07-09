@@ -27,12 +27,15 @@ class DisturbanceTemplate(object):
 
     def update(self, t, state):
         """
-        Given the present time and vehicle state dict, return the disturbance wrench to hold
-        over the upcoming integration step.
+        Given the present time and vehicle state dict, return the disturbance to hold over the
+        upcoming integration step.
 
         Returns:
             dict with:
                 'force',  np.ndarray shape (3,), external force in the WORLD frame [N]
                 'torque', np.ndarray shape (3,), external torque in the BODY frame [N*m]
+                'motor_cmd_noise', np.ndarray shape (num_rotors,), additive noise on the normalized
+                    actuator command u in [0,1] (SkyDreamer eps_u). Only affects the
+                    'cmd_motor_throttle' abstraction; ignored by other control modes.
         """
-        return {'force': np.zeros(3), 'torque': np.zeros(3)}
+        return {'force': np.zeros(3), 'torque': np.zeros(3), 'motor_cmd_noise': np.zeros(4)}

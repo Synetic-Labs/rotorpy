@@ -31,10 +31,14 @@ class Environment():
                        safety_margin = 0.25,    # The radius of the safety region around the robot.
                        disturbance_profile = None,  # external-wrench disturbance profile; if none, no disturbance.
                        control_rate = None,     # controller update rate in Hz (<= sim_rate); if none, updates every physics step.
+                       imu_rate = None,         # IMU sample rate in Hz; if none, samples every physics step.
+                       mocap_rate = None,       # motion-capture sample rate in Hz; if none, samples every physics step.
                        ):
 
         self.sim_rate = sim_rate
         self.control_rate = control_rate
+        self.imu_rate = imu_rate
+        self.mocap_rate = mocap_rate
         self.vehicle = vehicle
         self.controller = controller
         self.trajectory = trajectory
@@ -138,6 +142,8 @@ class Environment():
                                                                                                                     terminate=self.terminate,
                                                                                                                     disturbance_profile=self.disturbance_profile,
                                                                                                                     control_rate=self.control_rate,
+                                                                                                                    imu_rate=self.imu_rate,
+                                                                                                                    mocap_rate=self.mocap_rate,
                                                                                                                     )
         if verbose:
             # Print relevant statistics or simulator status indicators here
