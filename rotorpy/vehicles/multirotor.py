@@ -98,6 +98,7 @@ class Multirotor(object):
                        aero = True,
                        enable_ground = False,
                        integrator_kwargs = None,
+                       motor_discretization = 'ode',
                 ):
         """
         Initialize quadrotor physical parameters.
@@ -271,11 +272,37 @@ class Multirotor(object):
         # acceleration is consistent with the step taken; see step().
         self._last_state_dot = None
 
-        # Integrator settings.
+        # Integrator settings. In addition to any scipy solve_ivp method (default 'RK45',
+        # adaptive), a sentinel method 'rk4' selects a single fixed-step classical RK4 step per
+        # step() call. The fixed-step path is the reference-matching, framework-portable integrator
+        # (parity with the batched torchdiffeq 'rk4' and, after the JAX port, with a diff-sim
+        # fixed-step solver). See scratchpad/rotorpy-physics-additions.md section G.
         if integrator_kwargs is None:
             self.integrator_kwargs = {'method':'RK45'}
         else:
             self.integrator_kwargs = integrator_kwargs
+
+        # Motor-speed discretization.
+        #   'ode'      (default): rotor speeds are a component of the integrated state; their
+        #              derivative (first-order lag or asymmetric rotor_dyn_coef) is handed to the
+        #              ODE solver like every other state.
+        #   'exact_exp': the linear first-order motor lag is advanced by its closed-form solution
+        #              Omega(t) = Omega_c + (Omega0 - Omega_c) * exp(-t / tau_m). The stiff motor
+        #              mode is removed from the numerical integrator: it is unconditionally stable
+        #              (monotone, never rings) and, in a differentiable sim, its per-step gradient
+        #              factor is the smooth contraction exp(-dt/tau_m) in (0,1) instead of the
+        #              explicit integrator's (1 - dt/tau_m). Only defined for the linear lag; it has
+        #              no closed form for the asymmetric rotor_dyn_coef model. Math + JAX-port notes
+        #              in scratchpad/rotorpy-physics-additions.md section G.
+        if motor_discretization not in ('ode', 'exact_exp'):
+            raise ValueError("motor_discretization must be 'ode' or 'exact_exp'")
+        if motor_discretization == 'exact_exp' and self._rotor_dyn_active:
+            raise ValueError(
+                "motor_discretization='exact_exp' is only defined for the linear first-order motor "
+                "lag; it has no closed form for the asymmetric rotor_dyn_coef model. Set "
+                "rotor_dyn_coef=None or use motor_discretization='ode'.")
+        self.motor_discretization = motor_discretization
+        self._motor_exact = (motor_discretization == 'exact_exp')
 
     def extract_geometry(self):
         """
@@ -336,6 +363,20 @@ class Multirotor(object):
         self._cmd_buffer.append(control)
         return self._cmd_buffer[0]   # oldest entry: n_delay steps back once the line is full
 
+    @staticmethod
+    def _rk4_step(f, s, h):
+        """
+        A single classical fixed-step RK4 step of size h for s' = f(t, s). Matches torchdiffeq's
+        method='rk4' integrated over the grid [0, h] (one step), so the NumPy and batched
+        fixed-step paths agree. f is passed the stage time t, which the exact-exp motor model uses
+        to evaluate the closed-form Omega(t).
+        """
+        k1 = f(0.0, s)
+        k2 = f(0.5 * h, s + (0.5 * h) * k1)
+        k3 = f(0.5 * h, s + (0.5 * h) * k2)
+        k4 = f(h, s + h * k3)
+        return s + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
     def step(self, state, control, t_step):
         """
         Integrate dynamics forward from state given constant control for time t_step.
@@ -349,22 +390,33 @@ class Multirotor(object):
         effective_max = self.rotor_speed_max * self.rotor_speed_max_scale
         cmd_rotor_speeds = np.clip(cmd_rotor_speeds, self.rotor_speed_min, effective_max)
 
-        # Form autonomous ODE for constant inputs and integrate one time step.
+        # Form autonomous ODE for constant inputs and integrate one time step. In exact_exp mode
+        # capture Omega0 so the closed-form motor solution can be reconstructed at each stage time.
+        w0 = state['rotor_speeds'].copy() if self._motor_exact else None
         def s_dot_fn(t, s):
-            return self._s_dot_fn(t, s, cmd_rotor_speeds)
+            return self._s_dot_fn(t, s, cmd_rotor_speeds, rotor_speeds0=w0)
         s = Multirotor._pack_state(state)
 
-        # Integrate
-        sol = scipy.integrate.solve_ivp(
-            s_dot_fn,
-            (0.0, t_step),
-            s,
-            **self.integrator_kwargs
-        )
-        s = sol['y'][:, -1]
+        # Integrate one step: 'rk4' is a single fixed-step classical RK4 (reference/parity path);
+        # any other method goes through scipy's (adaptive) solve_ivp.
+        if self.integrator_kwargs.get('method') == 'rk4':
+            s = Multirotor._rk4_step(s_dot_fn, s, t_step)
+        else:
+            sol = scipy.integrate.solve_ivp(
+                s_dot_fn,
+                (0.0, t_step),
+                s,
+                **self.integrator_kwargs
+            )
+            s = sol['y'][:, -1]
 
         # Unpack the state vector.
         state = Multirotor._unpack_state(s)
+
+        # Exact-exp motor: the solver held the rotor speeds at Omega0; overwrite them with the
+        # closed-form Omega(t_step).
+        if self._motor_exact:
+            state['rotor_speeds'] = cmd_rotor_speeds + (w0 - cmd_rotor_speeds) * np.exp(-t_step / self.tau_m)
 
         # Re-normalize unit quaternion.
         state['q'] = state['q'] / norm(state['q'])
@@ -386,22 +438,35 @@ class Multirotor(object):
 
         return state
 
-    def _s_dot_fn(self, t, s, cmd_rotor_speeds):
+    def _s_dot_fn(self, t, s, cmd_rotor_speeds, rotor_speeds0=None):
         """
         Compute derivative of state for quadrotor given fixed control inputs as
         an autonomous ODE.
+
+        rotor_speeds0 is only used by the 'exact_exp' motor discretization: it is the rotor speed
+        at the start of the step (Omega0), from which the closed-form Omega(t) is reconstructed at
+        the solver's stage time t. It is ignored in 'ode' mode.
         """
 
         state = Multirotor._unpack_state(s)
 
-        rotor_speeds = state['rotor_speeds']
         inertial_velocity = state['v']
         wind_velocity = state['wind']
 
         R = Rotation.from_quat(state['q']).as_matrix()
 
-        # Rotor speed derivative (first-order lag, or asymmetric spin-up/spin-down if configured)
-        rotor_accel = self._rotor_accel(cmd_rotor_speeds, rotor_speeds)
+        if self._motor_exact:
+            # Closed-form linear-lag motor: the rotor speed and its derivative are analytic
+            # functions of the stage time t; the motor state is NOT numerically integrated (its
+            # ODE slot is zeroed below and overwritten with Omega(t_step) after the step).
+            w0 = state['rotor_speeds'] if rotor_speeds0 is None else rotor_speeds0
+            decay = np.exp(-t / self.tau_m)
+            rotor_speeds = cmd_rotor_speeds + (w0 - cmd_rotor_speeds) * decay
+            rotor_accel = (cmd_rotor_speeds - rotor_speeds) / self.tau_m   # = -(w0-Omega_c)/tau * decay
+        else:
+            rotor_speeds = state['rotor_speeds']
+            # Rotor speed derivative (first-order lag, or asymmetric spin-up/spin-down if configured)
+            rotor_accel = self._rotor_accel(cmd_rotor_speeds, rotor_speeds)
 
         # Position derivative.
         x_dot = state['v']
@@ -448,7 +513,9 @@ class Multirotor(object):
         s_dot[6:10]  = q_dot
         s_dot[10:13] = w_dot
         s_dot[13:16] = wind_dot
-        s_dot[16:]   = rotor_accel
+        # In exact_exp mode the motor state is advanced analytically, not integrated: hold it
+        # constant through the solver (derivative 0) and overwrite with Omega(t_step) in step().
+        s_dot[16:]   = 0.0 if self._motor_exact else rotor_accel
 
         return s_dot
 
@@ -857,8 +924,9 @@ class BatchedMultirotorParams:
         self.k_flap = torch.tensor([multirotor_params['k_flap'] for multirotor_params in multirotor_params_list]).unsqueeze(-1).to(device)   # Flapping moment coefficient Nm/(m/s)
         self.k_h = torch.tensor([multirotor_params['k_h'] for multirotor_params in multirotor_params_list]).unsqueeze(-1).double().to(device)   # translational lift coeff N/(m/s)**2
 
-        # Motor parameters
-        self.tau_m           = torch.tensor([multirotor_params['tau_m'] for multirotor_params in multirotor_params_list], device=device).unsqueeze(-1)
+        # Motor parameters. tau_m is stored as double: the exact_exp motor discretization uses it
+        # inside exp(-dt/tau_m), where a float32 tau injects a ~1e-7 relative error (finding F-8).
+        self.tau_m           = torch.tensor([multirotor_params['tau_m'] for multirotor_params in multirotor_params_list], device=device, dtype=torch.double).unsqueeze(-1)
         self.motor_noise     = torch.tensor([multirotor_params['motor_noise_std'] for multirotor_params in multirotor_params_list], device=device).unsqueeze(-1) # noise added to the actual motor speed, rad/s / sqrt(Hz)
 
         # ---- Optional physics additions (all default-inert, mirroring the single-drone Multirotor) ----
@@ -1052,10 +1120,25 @@ class BatchedMultirotor(object):
                  device,
                  control_abstraction='cmd_motor_speeds',
                  aero=True,
-                 integrator='dopri5'
+                 integrator='dopri5',
+                 motor_discretization='ode',
+                 grad_mode='detach'
                  ):
         """
         Initialize quadrotor physical parameters.
+
+        motor_discretization: 'ode' (default) integrates the rotor speeds with the rest of the
+            state; 'exact_exp' advances the linear first-order motor lag in closed form
+            (Omega(t) = Omega_c + (Omega0 - Omega_c) exp(-t/tau_m)). See the single-drone
+            Multirotor and scratchpad/rotorpy-physics-additions.md section G.
+        grad_mode: selects the forward-vs-differentiable behavior of step().
+            'detach'    (default) forward-only; the step runs under torch.no_grad (no autograd
+                        graph) -- numerically identical to before, used for data-gen / RL rollouts.
+            'full'      differentiate through the true fixed-step dynamics (exact gradients, high
+                        memory). Requires integrator='rk4'.
+            'surrogate' flightning-style: forward uses the full model, the backward pass substitutes
+                        the Jacobian of a simplified point-mass model (cheap, low-variance
+                        gradients). Requires integrator='rk4'.
         """
         assert initial_states['x'].device == device, "Initial states must already be on the specified device."
         assert initial_states['x'].shape[0] == num_drones
@@ -1078,6 +1161,30 @@ class BatchedMultirotor(object):
 
         assert integrator == 'dopri5' or integrator == "rk4"
         self.integrator = integrator
+
+        # Motor discretization + gradient mode (see the class/constructor docstrings and the
+        # single-drone Multirotor for the math). All defaults preserve current behavior exactly.
+        assert motor_discretization in ('ode', 'exact_exp')
+        assert grad_mode in ('detach', 'full', 'surrogate')
+        if grad_mode in ('full', 'surrogate') and integrator != 'rk4':
+            raise ValueError(
+                "grad_mode='%s' (differentiable mode) requires integrator='rk4': adaptive solvers "
+                "such as dopri5 have data-dependent step-size control and are not cleanly "
+                "differentiable." % grad_mode)
+        if motor_discretization == 'exact_exp':
+            # exact_exp is only valid for the linear first-order lag. In the batched params
+            # rotor_dyn_coef defaults to [1/tau, 0, 1/tau, 0]; anything else is asymmetric/nonlinear.
+            rdc = self.params.rotor_dyn_coef  # (num_drones, 4) = [ka1, ka2, kd1, kd2]
+            is_linear = (torch.allclose(rdc[:, 1], torch.zeros_like(rdc[:, 1]))
+                         and torch.allclose(rdc[:, 3], torch.zeros_like(rdc[:, 3]))
+                         and torch.allclose(rdc[:, 0], rdc[:, 2]))
+            if not is_linear:
+                raise ValueError(
+                    "motor_discretization='exact_exp' is only defined for the linear first-order "
+                    "motor lag; the configured rotor_dyn_coef is asymmetric/nonlinear.")
+        self.motor_discretization = motor_discretization
+        self._motor_exact = (motor_discretization == 'exact_exp')
+        self.grad_mode = grad_mode
 
     def statedot(self, state, control, t_step, idxs):
         """
@@ -1116,30 +1223,52 @@ class BatchedMultirotor(object):
             - control: dictionary with keys depending on the chosen control mode. Values are torch tensors, again with dtype double and with a batch dimension equal to the number of drones.
             - t_step: float, the duration for which to step the simulation.
             - idxs: integer array of shape (num_running_drones, )
+
+        Behavior is selected by self.grad_mode (see __init__):
+            'detach'    -> forward-only under torch.no_grad (default; identical numbers to before).
+            'full'      -> the same forward step but with the autograd graph retained, so
+                           loss.backward() differentiates through the true fixed-step dynamics.
+            'surrogate' -> forward = full model, backward = simplified point-mass Jacobian.
         """
         if idxs is None:
             idxs = [i for i in range(self.num_drones)]
+
+        if self.grad_mode == 'detach':
+            with torch.no_grad():
+                return self._step_full(state, control, t_step, idxs)
+        elif self.grad_mode == 'full':
+            return self._step_full(state, control, t_step, idxs)
+        else:  # 'surrogate'
+            return self._step_surrogate(state, control, t_step, idxs)
+
+    def _step_full(self, state, control, t_step, idxs):
+        """The full-model forward step (the original step body). Used directly by grad_mode
+        'detach'/'full', and as the forward value of the 'surrogate' straight-through step."""
         cmd_rotor_speeds = self.get_cmd_motor_speeds(state, control, idxs)
 
         # The true motor speeds can not fall below min and max speeds.
         cmd_rotor_speeds = torch.clip(cmd_rotor_speeds, self.params.rotor_speed_min[idxs],
                                       self.params.rotor_speed_max[idxs])
 
+        # In exact_exp mode capture Omega0 so the closed-form motor solution can be reconstructed at
+        # each solver stage time.
+        w0 = state['rotor_speeds'][idxs] if self._motor_exact else None
+
         # Form autonomous ODE for constant inputs and integrate one time step.
         def s_dot_fn(t, s):
-            return self._s_dot_fn(t, s, cmd_rotor_speeds, idxs)
+            return self._s_dot_fn(t, s, cmd_rotor_speeds, idxs, rotor_speeds0=w0)
 
         s = BatchedMultirotor._pack_state(state, self.num_drones, self.device)
 
-        # Option 1 - RK45 integration
-        # sol = scipy.integrate.solve_ivp(s_dot_fn, (0, t_step), s, first_step=t_step)
         sol = odeint(s_dot_fn, s[idxs], t=torch.tensor([0.0, t_step], device=self.device), method=self.integrator)
-        # s = sol['y'][:,-1]
         s = sol[-1, :]
-        # Option 2 - Euler integration
-        # s = s + s_dot_fn(0, s) * t_step  # first argument doesn't matter. It's time invariant model
 
         state = BatchedMultirotor._unpack_state(s, idxs, self.num_drones)
+
+        # Exact-exp motor: the solver held rotor speeds at Omega0; overwrite with Omega(t_step).
+        if self._motor_exact:
+            tau = self.params.tau_m[idxs]
+            state['rotor_speeds'][idxs] = cmd_rotor_speeds + (w0 - cmd_rotor_speeds) * torch.exp(-t_step / tau)
 
         # Re-normalize unit quaternion.
         state['q'][idxs] = state['q'][idxs] / torch.norm(state['q'][idxs], dim=-1).unsqueeze(-1)
@@ -1154,11 +1283,87 @@ class BatchedMultirotor(object):
 
         return state
 
+    def _step_surrogate(self, state, control, t_step, idxs):
+        """
+        Surrogate-gradient step (flightning's differentiable-sim trick, reverse-mode form).
+
+        Forward value = the full nonlinear model (computed under no_grad). The backward gradient is
+        supplied by a simplified point-mass model via a straight-through estimator:
+            out = simplified + (full - simplified).detach()
+        so out == full numerically while d(out)/d(theta) == d(simplified)/d(theta). This substitutes
+        the well-conditioned simplified Jacobian for the true one, exactly as flightning replaces the
+        JVP with the reduced model -- but expressed as a VJP, which is what torch BPTT needs.
+
+        Only x, v, q, w carry the simplified gradient; rotor_speeds (and wind) pass through the full
+        value detached, since the point-mass surrogate has no motor/rotational dynamics.
+        """
+        with torch.no_grad():
+            next_full = self._step_full(state, control, t_step, idxs)
+
+        c, w_cmd = self._surrogate_inputs(state, control, idxs)
+        x_s, v_s, q_s, w_s = self._simplified_step(
+            state['x'][idxs], state['v'][idxs], state['q'][idxs], w_cmd, c, t_step)
+
+        def straight_through(key, simplified):
+            full_slice = next_full[key][idxs]
+            return simplified + (full_slice - simplified).detach()
+
+        idx_t = torch.as_tensor(idxs, device=self.device, dtype=torch.long)
+        out = {k: next_full[k] for k in next_full}
+        out['x'] = next_full['x'].index_copy(0, idx_t, straight_through('x', x_s))
+        out['v'] = next_full['v'].index_copy(0, idx_t, straight_through('v', v_s))
+        out['q'] = next_full['q'].index_copy(0, idx_t, straight_through('q', q_s))
+        out['w'] = next_full['w'].index_copy(0, idx_t, straight_through('w', w_s))
+        return out
+
+    def _surrogate_inputs(self, state, control, idxs):
+        """
+        Differentiable inputs to the point-mass surrogate: the mass-normalized collective thrust c
+        and the commanded body rate w_cmd. c is formed from the commanded motor speeds (so gradient
+        flows to the control for every abstraction, and directly to the commanded speeds for
+        cmd_motor_speeds); the motors are treated as instantaneous, matching the point-mass model.
+        For cmd_ctbr, w_cmd is the direct body-rate command; otherwise the current body rate (the
+        surrogate assumes instantaneous rate tracking, w' = w_cmd).
+        """
+        cmd_rotor_speeds = self.get_cmd_motor_speeds(state, control, idxs)
+        cmd_rotor_speeds = torch.clip(cmd_rotor_speeds, self.params.rotor_speed_min[idxs],
+                                      self.params.rotor_speed_max[idxs])
+        thrust = (self.params.thrust_c0[idxs] + self.params.thrust_c1[idxs] * cmd_rotor_speeds
+                  + self.params.k_eta[idxs] * cmd_rotor_speeds ** 2)             # (n, num_rotors)
+        c = torch.sum(thrust, dim=1, keepdim=True) / self.params.mass[idxs]      # (n, 1)
+        if self.control_abstraction == 'cmd_ctbr':
+            w_cmd = control['cmd_w'][idxs]
+        else:
+            w_cmd = state['w'][idxs]
+        return c, w_cmd
+
+    def _simplified_step(self, x, v, q, w_cmd, c, t_step):
+        """
+        Point-mass + kinematic-attitude surrogate (flightning's differentiable model):
+            x' = x + dt * v
+            v' = v + dt * (g + R(q) @ [0, 0, c])     c = collective thrust / mass
+            q' = q (x) exp(dt * w_cmd)               body-frame rate, perfect tracking
+            w' = w_cmd
+        All ops are smooth and differentiable; this is the model whose Jacobian the surrogate uses.
+        """
+        R = roma.unitquat_to_rotmat(q).double()
+        g = torch.tensor([0.0, 0.0, -self.params.g], device=self.device).double()
+        thrust_world = R[..., :, 2] * c                       # R @ [0,0,c] = c * (third column)
+        v_new = v + t_step * (g + thrust_world)
+        x_new = x + t_step * v
+        dq = roma.rotvec_to_unitquat(t_step * w_cmd)          # [x,y,z,w], same convention as q
+        q_new = roma.quat_product(q, dq)
+        w_new = w_cmd
+        return x_new, v_new, q_new, w_new
+
     # Cmd rotor speeds should already have the appropriate drones selected.
-    def _s_dot_fn(self, t, s, cmd_rotor_speeds, idxs):
+    def _s_dot_fn(self, t, s, cmd_rotor_speeds, idxs, rotor_speeds0=None):
         """
         Compute derivative of state for quadrotor given fixed control inputs as
         an autonomous ODE.
+
+        rotor_speeds0 (Omega0) is only used by the 'exact_exp' motor discretization to reconstruct
+        the closed-form Omega(t) at the solver's stage time t; ignored in 'ode' mode.
         """
 
         # so this will be zero for some stuff.
@@ -1171,13 +1376,21 @@ class BatchedMultirotor(object):
         # R = Rotation.from_quat(state['q']).as_matrix()
         R = roma.unitquat_to_rotmat(state['q'][idxs]).double()
 
-        # Rotor speed derivative: asymmetric spin-up/spin-down (reduces to first-order 1/tau_m by
-        # default, since rotor_dyn_coef defaults to [1/tau,0,1/tau,0]).
-        rdc = self.params.rotor_dyn_coef[idxs]
-        ka1, ka2, kd1, kd2 = rdc[:, 0:1], rdc[:, 1:2], rdc[:, 2:3], rdc[:, 3:4]
-        _d = cmd_rotor_speeds - rotor_speeds
-        _dsq = cmd_rotor_speeds ** 2 - rotor_speeds ** 2
-        rotor_accel = torch.where(cmd_rotor_speeds > rotor_speeds, ka1 * _d + ka2 * _dsq, kd1 * _d + kd2 * _dsq)
+        if self._motor_exact:
+            # Closed-form linear-lag motor: Omega(t) and Omega_dot(t) are analytic in the stage
+            # time t; the motor state is not numerically integrated (its ODE slot is zeroed below).
+            w0 = state['rotor_speeds'][idxs] if rotor_speeds0 is None else rotor_speeds0
+            tau = self.params.tau_m[idxs]
+            rotor_speeds = cmd_rotor_speeds + (w0 - cmd_rotor_speeds) * torch.exp(-t / tau)
+            rotor_accel = (cmd_rotor_speeds - rotor_speeds) / tau
+        else:
+            # Rotor speed derivative: asymmetric spin-up/spin-down (reduces to first-order 1/tau_m by
+            # default, since rotor_dyn_coef defaults to [1/tau,0,1/tau,0]).
+            rdc = self.params.rotor_dyn_coef[idxs]
+            ka1, ka2, kd1, kd2 = rdc[:, 0:1], rdc[:, 1:2], rdc[:, 2:3], rdc[:, 3:4]
+            _d = cmd_rotor_speeds - rotor_speeds
+            _dsq = cmd_rotor_speeds ** 2 - rotor_speeds ** 2
+            rotor_accel = torch.where(cmd_rotor_speeds > rotor_speeds, ka1 * _d + ka2 * _dsq, kd1 * _d + kd2 * _dsq)
 
         # Position derivative.
         x_dot = state['v'][idxs]
@@ -1222,7 +1435,9 @@ class BatchedMultirotor(object):
         s_dot[:, 6:10] = q_dot
         s_dot[:, 10:13] = w_dot.squeeze(-1)
         s_dot[:, 13:16] = wind_dot
-        s_dot[:, 16:] = rotor_accel
+        # In exact_exp mode the motor state is advanced analytically, not integrated: hold it
+        # constant through the solver and overwrite with Omega(t_step) in _step_full.
+        s_dot[:, 16:] = torch.zeros_like(rotor_accel) if self._motor_exact else rotor_accel
 
         return s_dot
 

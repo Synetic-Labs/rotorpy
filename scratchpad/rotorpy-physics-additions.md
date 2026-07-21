@@ -209,6 +209,10 @@ NumPy: `scipy.solve_ivp`, default adaptive RK45, configurable (:183–186,242–
 renormalization both paths. (For firmware port: fixed-step RK4 is the reference-matching choice;
 SkyDreamer used RK4 @ 2.2 ms.)
 
+> **Integration *modes* (fixed-step, exact-exponential motor) and *differentiable simulation*
+> (forward / full-backprop / surrogate gradient) are documented in Part II section G.** That section
+> is the framework-agnostic math for the eventual JAX port.
+
 ## 1.9 Existing domain-randomization machinery (data plumbing, not physics)
 
 `learning_utils.py`: samples/applies mass, k_η, k_m, inertia, τ_m, motor noise;
@@ -508,6 +512,174 @@ Default reproduces the aligned wrench exactly. Verified by `scratchpad/tests/tes
 regression (no x/y force at default), single-rotor tilt vs hand-computed `Σ r×T` + tilted yaw
 (`Fx = T·sinθ`), uniform-tilt net-thrust tilt, yaw z-scaling by `cosθ`. NumPy only (batched deferred,
 consistent with other forward-model ports).
+
+## G. Integration modes & differentiable simulation ✅ (implemented 2026-07-21)
+
+**Source:** `uzh-rpg/rpg_flightning` (Heeg, Song, Scaramuzza, *Learning Quadrotor Control From
+Visual Features Using Differentiable Simulation*, ICRA 2025) — a JAX differentiable simulator.
+Physically RotorPy is a strict superset of flightning; the transferable ideas are its *machinery*
+for differentiable simulation, not any force/torque term. This section is written framework-agnostic
+because it is the reference for the planned JAX rewrite ([[jax-port-intent]]); PyTorch/NumPy specifics
+are called out as such.
+
+### G.0 The NumPy/scipy limitation (why "differentiable mode" is not universal)
+
+`scipy.integrate.solve_ivp` is not differentiable (no autodiff through a compiled Fortran/C solver),
+and its adaptive step controller makes data-dependent decisions (step accept/reject, variable eval
+count) that have no meaningful derivative anyway. So gradients can only live in a **tensor** backend
+(today PyTorch `BatchedMultirotor`; tomorrow JAX). The NumPy `Multirotor` gets the *integrator* and
+*motor-discretization* switches for reference parity, but no gradient mode. Concretely:
+
+| switch | values | classes | default |
+|---|---|---|---|
+| `integrator` | adaptive (`RK45`/`dopri5`) vs fixed-step (`rk4`) | both | `RK45` (NumPy) / `dopri5` (batched) |
+| `motor_discretization` | `ode` vs `exact_exp` | both | `ode` |
+| `grad_mode` | `detach` / `full` / `surrogate` | batched only | `detach` |
+
+All defaults reproduce the pre-existing behavior bit-for-bit (the opt-in invariant of this doc).
+`grad_mode` **is** the forward-vs-differentiable switch: `detach` = forward-only (any integrator);
+`full`/`surrogate` = differentiable and **require `integrator='rk4'`** (see G.3).
+
+### G.1 State notation
+
+`x` position (world), `v` velocity (world), `q`/`R` attitude, `ω` body rate, `Ω = (Ω₁…Ω_n)` rotor
+speeds. Step size `dt`. Commanded rotor speeds `Ω_c` (held constant over a step — zero-order hold).
+Motor time constant `τ ≡ tau_m`. Mass `m`, gravity `g = [0,0,-9.81]`.
+
+### G.2 Motor discretization — `ode` vs `exact_exp`
+
+The **linear first-order motor lag** is
+```
+Ω̇ = (Ω_c − Ω) / τ.                                                    (G.1)
+```
+`ode` mode (default): `Ω` is a component of the integrated state vector `s`; `Ω̇` from (G.1) — or
+the asymmetric A4 model — is returned by the RHS and handed to the ODE solver like every other
+state. This is exact-in-the-limit but couples the *stiffest* mode of the system into the numerical
+integrator.
+
+`exact_exp` mode: (G.1) with `Ω_c` constant over the step has the **closed-form solution**
+```
+Ω(t)  = Ω_c + (Ω₀ − Ω_c) · e^{−t/τ},     0 ≤ t ≤ dt,                   (G.2)
+Ω̇(t) = (Ω_c − Ω(t)) / τ = −(Ω₀ − Ω_c)/τ · e^{−t/τ}.                   (G.3)
+```
+Implementation (operator split): the rotor speed is **removed from the numerically-integrated
+state** (its ODE-slot derivative is set to 0 so the solver holds it at `Ω₀`); inside the RHS the
+rotor thrust uses `Ω(t)` from (G.2) at the solver's stage time `t`, and the rotor-inertia moment
+(A5) uses `Ω̇(t)` from (G.3). After the step, `Ω` is overwritten with `Ω(dt)`. The rigid-body 16-dim
+state is still integrated normally. Code: `Multirotor._s_dot_fn`/`step` and
+`BatchedMultirotor._s_dot_fn`/`_step_full`, keyed on `self._motor_exact`.
+
+**Why bother.** Removing the stiff mode from the numerical integrator gives:
+- **Unconditional stability / monotonicity.** (G.2) decays to `Ω_c` for *any* `dt` and never
+  overshoots or rings. An explicit integrator of (G.1) is stable only for `dt/τ ≲ 2.78` (RK4) or
+  `dt/τ < 2` (forward Euler); flightning uses fixed-step Euler at 1 kHz, so this matters there.
+- **A well-behaved gradient factor** (the reason it matters in a *differentiable* sim, G.5): the
+  per-step sensitivity `∂Ω(dt)/∂Ω₀ = e^{−dt/τ} ∈ (0,1)` is a contraction, versus the explicit
+  Euler factor `(1 − dt/τ)` which is negative and `|·|>1` once `dt/τ>1`, producing sign-alternating,
+  exploding gradients on the stiffest mode when unrolled over a horizon.
+
+**Limitation.** (G.2) exists only for the linear lag. The asymmetric A4 model
+`Ω̇ = ka1·(Ω_c−Ω) + ka2·(Ω_c²−Ω²)` (spin-up) / `kd…` (spin-down) has no closed form, so
+`exact_exp` + `rotor_dyn_coef` raises `ValueError` (both classes; the batched check tolerates the
+default `[1/τ,0,1/τ,0]` which *is* the linear lag). Precision note: batched `tau_m` is stored
+`double` — a float32 `τ` inside `e^{−dt/τ}` injects ~1e-7 relative error (a mini finding F-8).
+
+**Accuracy vs `ode` under RK45.** RK4/RK45 already match `e^{−h}` to 4th order, so at RotorPy step
+sizes the two modes agree to ~1e-8 (verified). `exact_exp` is therefore *not* an accuracy upgrade
+under an accurate adaptive solver — its value is (a) stability at coarse/fixed steps and (b) clean
+gradients. Use `ode` when you want the plain high-fidelity forward sim; use `exact_exp` for
+fixed-step differentiable rollouts.
+
+### G.3 Forward vs differentiable; why adaptive solvers can't be differentiated cleanly
+
+`grad_mode='detach'` (default) runs the full forward step with **no autograd graph** (PyTorch:
+under `torch.no_grad`). Numerically identical to before; used for data generation and model-free RL
+(the current PPO path never needed gradients through the sim).
+
+`grad_mode ∈ {full, surrogate}` build a graph and require a **fixed-step** integrator (`rk4`). An
+adaptive solver's step-size controller branches on the local error estimate — the number of RHS
+evaluations and the step grid are *data-dependent*, so the unrolled graph is not a fixed function of
+the inputs and reverse-mode AD through it is ill-defined/again ill-conditioned. Fixed-step `rk4`
+over the grid `[0, dt]` is a single, static, differentiable composition of RHS evaluations. Guard:
+constructing with `grad_mode` full/surrogate and a non-`rk4` integrator raises `ValueError`.
+
+### G.4 `grad_mode='full'` — differentiate the true dynamics
+
+Run the fixed-step `rk4` step with the graph retained; `loss.backward()` differentiates through
+every RK4 stage and the full wrench (motor lag, drag, rotor-inertia, allocation…). Exact gradients,
+`O(horizon)` activation memory. Verified: autograd `∂loss/∂Ω_c` matches central finite differences
+of the true step to ~1e-12 (`test_diff_modes.py::test_full_grad_matches_fd`).
+
+### G.5 `grad_mode='surrogate'` — flightning's decoupled gradient
+
+**Idea.** Differentiating through stiff motor/drag terms gives high-variance, ill-conditioned
+gradients (flightning's central finding). So use the *full* model for the forward value but a
+*simplified point-mass model* for the backward Jacobian.
+
+**Simplified model** (`_simplified_step`), a point mass with kinematic attitude:
+```
+x' = x + dt · v
+v' = v + dt · ( g + R(q) · [0, 0, c] )        c = collective thrust / mass
+q' = q ⊗ exp(dt · ω_cmd)                        body-frame rate, perfect tracking
+ω' = ω_cmd                                                              (G.4)
+```
+This is flightning's `quadrotor_dyn`. Its Jacobian is smooth, cheap, and free of the stiff modes.
+
+**Differentiable inputs** `(c, ω_cmd)` (`_surrogate_inputs`), covering the two control interfaces
+the user selected:
+- collective thrust `c = (Σᵢ thrust(Ω_{c,i})) / m` from the *commanded* rotor speeds — so gradient
+  flows to the control for every abstraction, and directly to the commanded speeds for
+  `cmd_motor_speeds`. Motors are treated as instantaneous (consistent with the point mass).
+- `ω_cmd = control['cmd_w']` for `cmd_ctbr` (the direct body-rate command, exactly flightning);
+  otherwise `ω_cmd = ω` (current body rate — the surrogate assumes instantaneous rate tracking).
+
+**Reverse-mode construction (straight-through estimator).** flightning uses JAX forward-mode
+`custom_jvp` (replace the tangent). PyTorch BPTT needs reverse-mode (a VJP). The equivalent, for
+each output block `y ∈ {x',v',q',ω'}`:
+```
+y_out = y_simplified + (y_full − y_simplified).detach()                (G.5)
+```
+Value: `y_out = y_full` (the `.detach()` term contributes its value). Gradient:
+`∂y_out/∂θ = ∂y_simplified/∂θ` (the detached term contributes zero). So the forward rollout is the
+full high-fidelity model while the backward pass uses the simplified Jacobian — exactly the
+flightning substitution, expressed as a VJP. `rotor_speeds` (and `wind`) pass through the full value
+detached (the point mass has no motor state).
+
+Verified (`test_diff_modes.py`): (a) the surrogate forward output equals the full model bit-for-bit;
+(b) its gradient equals the gradient of a *pure* simplified step to 0.0 (the straight-through
+substitutes exactly the simplified Jacobian) and differs from the full-backprop gradient by ~3e-4
+(so it is genuinely the surrogate, not the true Jacobian).
+
+### G.6 Choosing a mode
+
+| goal | integrator | motor | grad_mode |
+|---|---|---|---|
+| high-fidelity forward sim / data-gen / model-free RL | adaptive | `ode` | `detach` |
+| reference / cross-sim parity, fixed-step | `rk4` | `ode` or `exact_exp` | `detach` |
+| exact gradients, compute available | `rk4` | `ode`/`exact_exp` | `full` |
+| stable low-variance gradients for policy BPTT | `rk4` | `exact_exp` | `surrogate` |
+
+### G.7 JAX-port notes (the durable target)
+
+- (G.1)–(G.5) are framework-agnostic and port verbatim.
+- `grad_mode='full'` → plain `jax.grad`/`jax.vjp` through a fixed-step step (e.g. a hand-rolled RK4
+  or `diffrax` with a fixed-step solver; avoid adaptive controllers for the reason in G.3).
+- `grad_mode='surrogate'` → `jax.custom_vjp` on the step (or flightning's `jax.custom_jvp` if you
+  prefer forward-mode), with the backward/tangent computed from `_simplified_step`. The
+  straight-through form (G.5) also works unchanged in JAX (`jax.lax.stop_gradient` for `.detach()`).
+- `exact_exp` is just `jnp.exp(-dt/τ)`; keep `τ` in the working float dtype (float32 is the mini-F-8
+  trap).
+- Adaptive `dopri5` is fine for the non-differentiable forward path in JAX too; it is only the
+  gradient path that must be fixed-step.
+
+### G.8 Verification
+
+`scratchpad/tests/test_motor_exact_exp.py` — closed-form (G.2) reproduced exactly; tight-tolerance
+`ode` converges to it (~5e-11); rigid-body agreement `ode`↔`exact_exp`; asymmetric guard; NumPy
+`rk4` path; NumPy↔batched exact parity. `scratchpad/tests/test_diff_modes.py` — the rk4 guard,
+`detach` produces no graph, `full` grad vs finite differences, surrogate value == full, surrogate
+grad == simplified Jacobian (and ≠ full). Regression: `test_batched_parity.py` and `pytest tests/`
+unchanged (defaults untouched).
 
 ## E3. Separate observation / sensor sample rates (harness, approved 2026-07-08)
 
